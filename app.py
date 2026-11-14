@@ -1,524 +1,676 @@
+import math
 import random
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import altair as alt
+import numpy as np
+import pandas as pd
 import streamlit as st
+
+try:
+    from deep_translator import GoogleTranslator
+except Exception:  # package missing -> English fallback
+    GoogleTranslator = None
 
 st.set_page_config(page_title="ASTRA MISSION TRAINER", page_icon="🚀", layout="wide")
 
-# ----------------------------------------------------------------------------
-# STYLE
-# ----------------------------------------------------------------------------
+# =============================================================================
+# LANGUAGES (11)
+# =============================================================================
+LANGS = {
+    "en": ("English", "en"),
+    "tr": ("Türkçe", "tr"),
+    "es": ("Español", "es"),
+    "fr": ("Français", "fr"),
+    "de": ("Deutsch", "de"),
+    "pt": ("Português", "pt"),
+    "ar": ("العربية", "ar"),
+    "ru": ("Русский", "ru"),
+    "zh": ("中文", "zh-CN"),
+    "ja": ("日本語", "ja"),
+    "hi": ("हिन्दी", "hi"),
+}
+LK = list(LANGS)  # order used by the hand-translated CORE table below
+
+
+def _core(*vals):
+    return dict(zip(LK, vals))
+
+
+# Hand-translated core interface (always works, even offline)
+CORE = {
+    "tagline": _core(
+        "Mission simulation and emergency decision training for young astronauts",
+        "Genç astronotlar için görev simülasyonu ve acil durum karar eğitimi",
+        "Simulación de misiones y entrenamiento de decisiones de emergencia para jóvenes astronautas",
+        "Simulation de missions et entraînement à la décision d'urgence pour jeunes astronautes",
+        "Missionssimulation und Notfall-Entscheidungstraining für junge Astronauten",
+        "Simulação de missões e treino de decisões de emergência para jovens astronautas",
+        "محاكاة المهام والتدريب على اتخاذ القرار في الطوارئ لرواد الفضاء الشباب",
+        "Симуляция миссий и тренировка принятия решений в аварийных ситуациях для юных астронавтов",
+        "面向青少年宇航员的任务模拟与紧急决策训练",
+        "若手宇宙飛行士のためのミッションシミュレーションと緊急時判断トレーニング",
+        "युवा अंतरिक्ष यात्रियों के लिए मिशन सिमुलेशन और आपातकालीन निर्णय प्रशिक्षण",
+    ),
+    "tab_mission": _core("Mission", "Görev", "Misión", "Mission", "Mission", "Missão", "المهمة", "Миссия", "任务", "ミッション", "मिशन"),
+    "tab_base": _core("Moon Base", "Ay Üssü", "Base lunar", "Base lunaire", "Mondbasis", "Base lunar", "القاعدة القمرية", "Лунная база", "月球基地", "月面基地", "चंद्र अड्डा"),
+    "tab_orbit": _core("Orbit", "Yörünge", "Órbita", "Orbite", "Umlaufbahn", "Órbita", "المدار", "Орбита", "轨道", "軌道", "कक्षा"),
+    "tab_gravity": _core("Gravity", "Yerçekimi", "Gravedad", "Gravité", "Schwerkraft", "Gravidade", "الجاذبية", "Гравитация", "重力", "重力", "गुरुत्व"),
+    "tab_life": _core("Life Support", "Yaşam Destek", "Soporte vital", "Survie", "Lebenserhaltung", "Suporte vital", "دعم الحياة", "Жизнеобеспечение", "生命保障", "生命維持", "जीवन समर्थन"),
+    "tab_reentry": _core("Re-entry", "Dönüş", "Reentrada", "Rentrée", "Wiedereintritt", "Reentrada", "العودة", "Возвращение", "再入", "再突入", "पुनःप्रवेश"),
+    "tab_mars": _core("Mars Landing", "Mars İniş", "Aterrizaje en Marte", "Atterrissage Mars", "Mars-Landung", "Pouso em Marte", "الهبوط على المريخ", "Посадка на Марс", "火星着陆", "火星着陸", "मंगल लैंडिंग"),
+    "tab_academy": _core("Academy", "Akademi", "Academia", "Académie", "Akademie", "Academia", "الأكاديمية", "Академия", "学院", "アカデミー", "अकादमी"),
+    "restart": _core("Restart", "Baştan başla", "Reiniciar", "Recommencer", "Neustart", "Reiniciar", "إعادة البدء", "Заново", "重新开始", "最初から", "फिर से शुरू"),
+    "start": _core("Launch mission", "Göreve başla", "Iniciar misión", "Lancer la mission", "Mission starten", "Iniciar missão", "ابدأ المهمة", "Начать миссию", "开始任务", "ミッション開始", "मिशन शुरू करें"),
+    "next": _core("Next", "Sonraki", "Siguiente", "Suivant", "Weiter", "Próximo", "التالي", "Далее", "下一步", "次へ", "अगला"),
+}
+
+# =============================================================================
+# STATE
+# =============================================================================
+ss = st.session_state
+ss.setdefault("lang", "en")
+ss.setdefault("done", set())
+ss.setdefault("orb_alt", 400)
+
+
+def C(key):
+    return CORE[key].get(ss.lang) or CORE[key]["en"]
+
+
+# =============================================================================
+# AUTO-TRANSLATION (cached, parallel, safe fallback to English)
+# =============================================================================
+@st.cache_resource
+def _store():
+    return {"d": {}, "fails": 0, "blocked_until": 0.0}
+
+
+def _translate_one(text, lang):
+    """Runs in worker threads: must NOT touch st.session_state."""
+    if GoogleTranslator is None:
+        return None
+    try:
+        out = GoogleTranslator(source="en", target=LANGS[lang][1]).translate(text)
+        return out or None
+    except Exception:
+        return None
+
+
+def T(text):
+    lang = ss.lang
+    if lang == "en" or not text or not text.strip():
+        return text
+    s = _store()
+    hit = s["d"].get((lang, text))
+    if hit:
+        return hit
+    if GoogleTranslator is None or time.time() < s["blocked_until"]:
+        return text
+    out = _translate_one(text, lang)
+    if out:
+        s["d"][(lang, text)] = out
+        s["fails"] = 0
+        return out
+    s["fails"] += 1
+    if s["fails"] >= 3:
+        s["blocked_until"] = time.time() + 120
+    return text
+
+
+def prewarm(texts):
+    lang = ss.lang
+    if lang == "en" or GoogleTranslator is None:
+        return
+    s = _store()
+    if time.time() < s["blocked_until"]:
+        return
+    todo = [t for t in dict.fromkeys(texts) if (lang, t) not in s["d"]]
+    if not todo:
+        return
+    with st.spinner("🌐 ..."):
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            results = list(ex.map(lambda t: _translate_one(t, lang), todo))
+    ok = 0
+    for t, r in zip(todo, results):
+        if r:
+            s["d"][(lang, t)] = r
+            ok += 1
+    if ok == 0:
+        s["fails"] = 3
+        s["blocked_until"] = time.time() + 120
+
+
+# =============================================================================
+# CONTENT
+# =============================================================================
+def ev(title, story, fact, best, ok, bad):
+    return {
+        "title": title, "story": story, "fact": fact,
+        "choices": [
+            {"text": best[0], "fx": best[1], "pts": 100, "why": best[2]},
+            {"text": ok[0], "fx": ok[1], "pts": 50, "why": ok[2]},
+            {"text": bad[0], "fx": bad[1], "pts": 0, "why": bad[2]},
+        ],
+    }
+
+
+EVENTS = [
+    ev("Stuck airlock",
+       "After your spacewalk the airlock door will not seal and the crew is waiting inside.",
+       "Astronauts exit through an airlock that is depressurized, so the main cabin stays pressurized.",
+       ("Re-check the seals, run the airlock checklist and ask Mission Control for help", {"p": -5, "m": 5}, "Methodical checks with ground support solve most hardware faults."),
+       ("Try the door again several times", {"p": -10, "m": -5}, "Repeating the same action rarely fixes a seal fault."),
+       ("Force the door with a tool", {"p": -15, "o": -25}, "Forcing hardware can break the seal and damage the airlock.")),
+    ev("Power loss",
+       "One solar array lost its orientation and power generation dropped.",
+       "The International Space Station gets its power from huge solar arrays, and non-critical systems are shut down when needed.",
+       ("Switch to essential-only power and shut down non-critical systems", {"p": -5}, "Life support and communications come first: power is rationed by priority."),
+       ("Shut down only the science lab", {"p": -15}, "It saves some power, but not enough."),
+       ("Restart all systems at once", {"p": -35, "m": -5}, "Restarting everything causes a power surge and makes things worse.")),
+    ev("Communication blackout",
+       "Contact with Mission Control is lost. Only static on the radio.",
+       "Spacecraft lose contact with Earth when passing behind the Moon, so there are prepared procedures for it.",
+       ("Follow the lost-comm checklist and switch to the backup antenna", {"p": -5}, "Staying calm and following the procedure is the safest path."),
+       ("Wait quietly without doing anything", {"m": -10}, "Waiting alone is not enough: backup options must be tried."),
+       ("Do an unplanned engine burn to fix the position", {"f": -30, "m": -5}, "Maneuvering without ground control wastes fuel and can disturb the trajectory.")),
+    ev("Cabin fire alarm",
+       "Smoke is coming from an equipment rack and the fire alarm is sounding.",
+       "Space stations carry masks and CO2 extinguishers for fire emergencies.",
+       ("Cut power to the equipment, put on masks, use the CO2 extinguisher", {"o": -5, "p": -10}, "Cutting power removes the ignition source and masks protect you from smoke."),
+       ("Use the extinguisher but keep the equipment powered", {"o": -10, "p": -15}, "With power still on, the fire can restart."),
+       ("Open the vent to space to remove the smoke", {"o": -35, "m": -10}, "Venting cabin air to space endangers the whole crew.")),
+    ev("Crew health",
+       "A crew member feels dizzy and nauseous.",
+       "Many astronauts feel space motion sickness during their first days in weightlessness.",
+       ("Let them rest, drink water and consult the flight surgeon by radio", {"m": 10}, "Rest and medical advice protect health and raise crew morale."),
+       ("Give them a hard task to distract them", {"m": -10}, "Pushing a sick crew member can make things worse."),
+       ("Ignore it and keep the schedule", {"m": -25}, "Crew health is part of the mission, so symptoms are taken seriously.")),
+    ev("Re-entry preparation",
+       "Atmospheric re-entry is approaching. You must check the heat shield and fuel.",
+       "During re-entry the capsule faces extreme heat, and the heat shield protects the crew.",
+       ("Run the full checklist with Mission Control and verify heat shield and fuel", {"f": -10, "m": 5}, "Checklists reduce errors: nothing is skipped at a critical stage."),
+       ("Skip two checklist items to save time", {"f": -5, "m": -5}, "Small shortcuts can turn into big risks."),
+       ("Start re-entry immediately without verification", {"p": -20, "f": -20}, "In an unverified re-entry, mistakes cannot be undone.")),
+    ev("Robotic arm jam",
+       "The robotic arm froze while holding a heavy supply module.",
+       "Robotic arms like Canadarm2 help move cargo and assist astronauts outside the ISS.",
+       ("Stop all arm motion, switch to backup control and follow the safe-hold procedure", {"p": -5, "m": 5}, "A safe hold prevents damage while you diagnose the fault."),
+       ("Try to move the arm again slowly", {"p": -10, "m": -5}, "Moving a faulty arm can make the problem worse."),
+       ("Release the module without checking", {"f": -10, "m": -20}, "A loose module can drift into the station or be lost.")),
+    ev("Solar storm warning",
+       "Mission Control warns of a strong solar storm and radiation levels are rising.",
+       "Solar storms raise radiation, so astronauts shelter in the most shielded parts of the spacecraft.",
+       ("Move the crew to the shielded shelter area and monitor the dosimeters", {"m": 5, "p": -5}, "Shielding and monitoring reduce the radiation dose."),
+       ("Wear protective vests but continue the planned work", {"m": -10}, "Vests help, but staying exposed is still risky."),
+       ("Continue the spacewalk as scheduled", {"m": -30, "o": -10}, "Radiation exposure outside is the biggest danger.")),
+    ev("Water recycler failure",
+       "The water recycling unit shut down and the tank level is dropping.",
+       "The ISS recycles most of its water, including moisture from the air and urine.",
+       ("Switch to reserve water, ration use and follow the repair guide", {"p": -5, "m": 5}, "Rationing buys time while the repair is done."),
+       ("Ration water only and wait", {"m": -15}, "Rationing alone does not fix the unit."),
+       ("Use water freely and hope the unit recovers", {"m": -30, "p": -10}, "Wasting reserves can leave the crew without water.")),
+    ev("Docking misalignment",
+       "The capsule drifts off-axis while approaching the station for docking.",
+       "Spacecraft dock at speeds of only about 10 centimeters per second.",
+       ("Stop the approach, back off, realign and retry", {"f": -8, "m": 5}, "Aborting and retrying is routine and safe."),
+       ("Continue slowly and hope it corrects itself", {"f": -5, "m": -10}, "Hoping is not a plan, and the misalignment can grow."),
+       ("Speed up to force the docking", {"f": -20, "p": -15, "m": -15}, "Forcing a dock can damage both spacecraft.")),
+]
+
+BODIES = {
+    "Mercury": 3.70, "Venus": 8.87, "Earth": 9.81, "Moon": 1.62, "Mars": 3.71,
+    "Jupiter": 24.79, "Saturn": 10.44, "Uranus": 8.69, "Neptune": 11.15, "Pluto": 0.62,
+}
+
+BADGES = {
+    "mission": "🛰️", "base": "🌙", "orbit": "🌍", "reentry": "🔥", "mars": "🔴",
+}
+
+RANKS = [(500, "Commander 🥇"), (350, "Pilot 🥈"), (200, "Cadet 🥉"), (0, "Trainee 🚀")]
+
+
+def rank_of(score):
+    for th, name in RANKS:
+        if score >= th:
+            return name
+    return RANKS[-1][1]
+
+
+def mark(key):
+    ss.done.add(key)
+
+
+# ---- collect every string that should be pre-translated -----------------------
+try:
+    with open(__file__, encoding="utf-8") as _f:
+        _src = _f.read()
+except Exception:
+    _src = ""
+ALL_TEXTS = re.findall(r'\bT\(\s*"([^"\n]+)"\s*\)', _src)
+for _e in EVENTS:
+    ALL_TEXTS += [_e["title"], _e["story"], _e["fact"]]
+    for _c in _e["choices"]:
+        ALL_TEXTS += [_c["text"], _c["why"]]
+ALL_TEXTS += list(BODIES) + [n for _, n in RANKS]
+
+# =============================================================================
+# STYLE + SIDEBAR
+# =============================================================================
 st.markdown(
     """
     <style>
     .hero {padding: 1.2rem 1.4rem; border-radius: 16px;
            background: linear-gradient(135deg,#0b1026 0%,#1b2a6b 55%,#4b2a7b 100%);
            color: #fff; margin-bottom: 1rem;}
-    .hero h1 {margin: 0; font-size: 1.9rem; letter-spacing: 2px;}
-    .hero p {margin: .3rem 0 0 0; opacity: .85;}
+    .hero h1 {margin: 0; font-size: 1.9rem; letter-spacing: 2px; color:#fff;}
+    .hero p {margin: .3rem 0 0 0; opacity: .88; color:#fff;}
     .event {padding: 1rem 1.2rem; border-left: 5px solid #ff4b4b;
-            background: rgba(255,75,75,.08); border-radius: 8px; margin: .6rem 0;}
+            background: rgba(255,75,75,.10); border-radius: 8px; margin: .6rem 0;}
     .fact {padding: .7rem 1rem; border-left: 5px solid #4b8bff;
-           background: rgba(75,139,255,.08); border-radius: 8px; margin: .6rem 0;}
+           background: rgba(75,139,255,.10); border-radius: 8px; margin: .6rem 0;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ----------------------------------------------------------------------------
-# TEXTS
-# ----------------------------------------------------------------------------
-UI = {
-    "tagline": {
-        "tr": "Genç astronotlar için görev simülasyonu ve acil durum karar eğitimi",
-        "en": "Mission simulation and emergency decision training for young astronauts",
-    },
-    "tab_mission": {"tr": "🛰️ Görev Simülasyonu", "en": "🛰️ Mission Simulator"},
-    "tab_academy": {"tr": "🎓 Uzay Akademisi", "en": "🎓 Space Academy"},
-    "tab_about": {"tr": "ℹ️ Proje Hakkında", "en": "ℹ️ About"},
-    "language": {"tr": "Dil / Language", "en": "Language / Dil"},
-    "reset": {"tr": "🔄 Baştan başla", "en": "🔄 Restart"},
-    "callsign": {"tr": "Çağrı adın (callsign)", "en": "Your callsign"},
-    "start": {"tr": "🚀 Göreve başla", "en": "🚀 Launch mission"},
-    "intro": {
-        "tr": "Artemis-Junior görevindesin. Ay yörüngesinden Dünya'ya dönüş yolculuğunda 6 acil durum seni bekliyor. Oksijen ve enerji sıfıra inerse görev başarısız olur. Her kararın sonucu bir sonrakini etkiler.",
-        "en": "You are on the Artemis-Junior mission. On the return trip from lunar orbit, 6 emergencies are waiting. If oxygen or power reaches zero, the mission fails. Every decision affects the next one.",
-    },
-    "oxygen": {"tr": "Oksijen", "en": "Oxygen"},
-    "power": {"tr": "Enerji", "en": "Power"},
-    "fuel": {"tr": "Yakıt", "en": "Fuel"},
-    "morale": {"tr": "Moral", "en": "Morale"},
-    "event": {"tr": "Olay", "en": "Event"},
-    "decide": {"tr": "Kararını ver:", "en": "Make your decision:"},
-    "result": {"tr": "Sonuç", "en": "Result"},
-    "next": {"tr": "➡️ Sonraki olay", "en": "➡️ Next event"},
-    "finish": {"tr": "📋 Görev raporunu gör", "en": "📋 See mission debrief"},
-    "score": {"tr": "Puan", "en": "Score"},
-    "rank": {"tr": "Rütbe", "en": "Rank"},
-    "success": {"tr": "🎉 GÖREV TAMAMLANDI! Mürettebat güvenle Dünya'ya döndü.", "en": "🎉 MISSION COMPLETE! The crew returned safely to Earth."},
-    "fail": {"tr": "💥 GÖREV BAŞARISIZ. Kritik sistemler çöktü.", "en": "💥 MISSION FAILED. Critical systems collapsed."},
-    "debrief": {"tr": "📋 Görev Değerlendirmesi (Debrief)", "en": "📋 Mission Debrief"},
-    "your_choice": {"tr": "Senin seçimin", "en": "Your choice"},
-    "expert": {"tr": "Uzman yaklaşımı", "en": "Expert approach"},
-    "cert": {"tr": "📥 Sertifikayı indir", "en": "📥 Download certificate"},
-    "quiz_title": {"tr": "Uzay bilgini test et", "en": "Test your space knowledge"},
-    "quiz_check": {"tr": "Cevapları kontrol et", "en": "Check answers"},
-    "quiz_result": {"tr": "Doğru sayın", "en": "Correct answers"},
-    "quiz_pick": {"tr": "Bir seçenek seç", "en": "Pick an option"},
-    "correct": {"tr": "Doğru ✅", "en": "Correct ✅"},
-    "wrong": {"tr": "Yanlış ❌ Doğru cevap", "en": "Wrong ❌ Correct answer"},
-}
-
-EVENTS = [
-    {
-        "title": {"tr": "Oksijen sızıntısı", "en": "Oxygen leak"},
-        "story": {
-            "tr": "Alarm çalıyor! Yaşam modülünde oksijen basıncı hızla düşüyor.",
-            "en": "Alarm! Oxygen pressure in the habitat module is dropping fast.",
-        },
-        "fact": {
-            "tr": "1970'te Apollo 13'te bir oksijen tankı hasar gördü. Mürettebat, Ay modülünü cankurtaran botu gibi kullanarak güvenle döndü.",
-            "en": "In 1970 an oxygen tank failed on Apollo 13. The crew used the lunar module as a lifeboat and returned safely.",
-        },
-        "choices": [
-            {
-                "text": {"tr": "Sızan modülü izole et, kapağı kapat ve yama kitiyle sızıntıyı kapat", "en": "Isolate the leaking module, close the hatch and seal the leak with the patch kit"},
-                "fx": {"o": -5, "m": 5}, "pts": 100,
-                "why": {"tr": "Sorunu izole etmek kaybı sınırlar ve diğer modülleri korur.", "en": "Isolating the problem limits the loss and protects other modules."},
-            },
-            {
-                "text": {"tr": "Yedek tanklardan oksijen akışını artır ve izle", "en": "Increase oxygen flow from reserve tanks and monitor"},
-                "fx": {"o": -20}, "pts": 50,
-                "why": {"tr": "Geçici işe yarar ama sızıntı sürdüğü için yedek hızla tükenir.", "en": "It helps temporarily, but the leak continues and reserves drain quickly."},
-            },
-            {
-                "text": {"tr": "Alarmı görmezden gel, muhtemelen sensör hatasıdır", "en": "Ignore the alarm, it is probably a sensor error"},
-                "fx": {"o": -40, "m": -10}, "pts": 0,
-                "why": {"tr": "Alarmlar asla varsayımla kapatılmaz; önce doğrulanır.", "en": "Alarms are never dismissed by assumption; they are verified first."},
-            },
-        ],
-    },
-    {
-        "title": {"tr": "Enerji kaybı", "en": "Power loss"},
-        "story": {
-            "tr": "Güneş panellerinden biri yönünü kaybetti ve enerji üretimi düştü.",
-            "en": "One solar array lost its orientation and power generation dropped.",
-        },
-        "fact": {
-            "tr": "Uluslararası Uzay İstasyonu enerjisini büyük güneş panellerinden alır; kritik olmayan sistemler gerekirse kapatılır.",
-            "en": "The International Space Station gets its power from large solar arrays; non-critical systems are shut down when needed.",
-        },
-        "choices": [
-            {
-                "text": {"tr": "Yalnızca kritik sistemlere enerji ver, diğerlerini kapat", "en": "Switch to essential-only power and shut down non-critical systems"},
-                "fx": {"p": -5}, "pts": 100,
-                "why": {"tr": "Önce yaşam destek ve iletişim: enerji öncelik sırasına göre dağıtılır.", "en": "Life support and communications come first: power is rationed by priority."},
-            },
-            {
-                "text": {"tr": "Sadece laboratuvarı kapat", "en": "Shut down only the lab"},
-                "fx": {"p": -15}, "pts": 50,
-                "why": {"tr": "Biraz tasarruf sağlar ama yeterli değil.", "en": "It saves some power but not enough."},
-            },
-            {
-                "text": {"tr": "Tüm sistemleri aynı anda yeniden başlat", "en": "Restart all systems at once"},
-                "fx": {"p": -35, "m": -5}, "pts": 0,
-                "why": {"tr": "Yeniden başlatma ani enerji çekişi yaratır ve durumu kötüleştirir.", "en": "Restarting causes a power surge and makes things worse."},
-            },
-        ],
-    },
-    {
-        "title": {"tr": "İletişim kesintisi", "en": "Communication blackout"},
-        "story": {
-            "tr": "Görev Kontrol ile bağlantı koptu. Radyodan sadece parazit geliyor.",
-            "en": "Contact with Mission Control is lost. Only static on the radio.",
-        },
-        "fact": {
-            "tr": "Ay'ın arkasından geçerken uzay araçlarının Dünya ile iletişimi planlı olarak kesilir; bunun için önceden hazırlanmış prosedürler vardır.",
-            "en": "When passing behind the Moon, spacecraft planned lose contact with Earth; there are prepared procedures for this.",
-        },
-        "choices": [
-            {
-                "text": {"tr": "Kayıp-iletişim prosedürünü uygula, yedek antene geç, planlı aralıklarla tekrar dene", "en": "Follow the lost-comm checklist, switch to the backup antenna, retry at scheduled intervals"},
-                "fx": {"p": -5}, "pts": 100,
-                "why": {"tr": "Sakin kalıp prosedürü izlemek en güvenli yoldur.", "en": "Staying calm and following the procedure is the safest path."},
-            },
-            {
-                "text": {"tr": "Bir şey yapmadan bekle", "en": "Wait without doing anything"},
-                "fx": {"m": -10}, "pts": 50,
-                "why": {"tr": "Beklemek tek başına yeterli değil; yedek seçenekleri denemek gerekir.", "en": "Waiting alone is not enough; backup options must be tried."},
-            },
-            {
-                "text": {"tr": "Konumu 'düzeltmek' için plansız motor ateşlemesi yap", "en": "Do an unplanned engine burn to 'fix' the position"},
-                "fx": {"f": -30, "m": -5}, "pts": 0,
-                "why": {"tr": "Yer kontrolü olmadan manevra yakıtı boşa harcar ve yörüngeyi bozabilir.", "en": "Maneuvering without ground control wastes fuel and can disturb the orbit."},
-            },
-        ],
-    },
-    {
-        "title": {"tr": "Kabinde yangın alarmı", "en": "Cabin fire alarm"},
-        "story": {
-            "tr": "Ekipman rafından duman çıkıyor ve yangın alarmı çalıyor.",
-            "en": "Smoke is coming from an equipment rack and the fire alarm is sounding.",
-        },
-        "fact": {
-            "tr": "Uzay istasyonlarında yangınla mücadele için maskeler ve CO2 söndürücüler bulunur.",
-            "en": "Space stations carry masks and CO2 extinguishers for fire emergencies.",
-        },
-        "choices": [
-            {
-                "text": {"tr": "Etkilenen ekipmanın enerjisini kes, maskeleri tak, CO2 söndürücü kullan", "en": "Cut power to the affected equipment, put on masks, use the CO2 extinguisher"},
-                "fx": {"o": -5, "p": -10}, "pts": 100,
-                "why": {"tr": "Enerjiyi kesmek yangının kaynağını durdurur; maske dumandan korur.", "en": "Cutting power stops the fire source; masks protect from smoke."},
-            },
-            {
-                "text": {"tr": "Söndürücü kullan ama ekipman açık kalsın", "en": "Use the extinguisher but keep the equipment powered"},
-                "fx": {"o": -10, "p": -15}, "pts": 50,
-                "why": {"tr": "Enerji açıkken yangın yeniden başlayabilir.", "en": "With power on, the fire can restart."},
-            },
-            {
-                "text": {"tr": "Dumanı atmak için havalandırmayı uzaya aç", "en": "Open the vent to space to remove the smoke"},
-                "fx": {"o": -35, "m": -10}, "pts": 0,
-                "why": {"tr": "Kabin havasını uzaya vermek mürettebatı tehlikeye atar.", "en": "Venting cabin air to space endangers the crew."},
-            },
-        ],
-    },
-    {
-        "title": {"tr": "Mürettebat sağlığı", "en": "Crew health"},
-        "story": {
-            "tr": "Bir mürettebat üyesi başı dönüyor ve mide bulantısı yaşıyor.",
-            "en": "A crew member feels dizzy and nauseous.",
-        },
-        "fact": {
-            "tr": "Birçok astronot, ağırlıksızlığa uyum sürecinde ilk günlerde uzay tutması yaşayabilir.",
-            "en": "Many astronauts experience space motion sickness while adapting to weightlessness in the first days.",
-        },
-        "choices": [
-            {
-                "text": {"tr": "Dinlenmesini sağla, su içir ve telsizle uçuş doktoruna danış", "en": "Let them rest, hydrate, and consult the flight surgeon by radio"},
-                "fx": {"m": 10}, "pts": 100,
-                "why": {"tr": "Dinlenme ve tıbbi destek sağlığı korur, ekip moralini yükseltir.", "en": "Rest and medical support protect health and raise crew morale."},
-            },
-            {
-                "text": {"tr": "Zor bir görev verip dikkatini dağıt", "en": "Give them a tough task to distract them"},
-                "fx": {"m": -10}, "pts": 50,
-                "why": {"tr": "Zorlamak durumu kötüleştirebilir.", "en": "Pushing them can make it worse."},
-            },
-            {
-                "text": {"tr": "Görmezden gel ve programa devam et", "en": "Ignore it and keep the schedule"},
-                "fx": {"m": -25}, "pts": 0,
-                "why": {"tr": "Mürettebat sağlığı görevin parçasıdır; belirtiler ciddiye alınır.", "en": "Crew health is part of the mission; symptoms are taken seriously."},
-            },
-        ],
-    },
-    {
-        "title": {"tr": "Dünya'ya giriş hazırlığı", "en": "Re-entry preparation"},
-        "story": {
-            "tr": "Dünya atmosferine giriş yaklaşıyor. Isı kalkanı ve yakıt durumunu kontrol etmen gerekiyor.",
-            "en": "Atmospheric re-entry is approaching. You must check the heat shield and fuel status.",
-        },
-        "fact": {
-            "tr": "Atmosfere girişte kapsül çok yüksek sıcaklıklara ulaşır; ısı kalkanı mürettebatı korur.",
-            "en": "During re-entry the capsule reaches extremely high temperatures; the heat shield protects the crew.",
-        },
-        "choices": [
-            {
-                "text": {"tr": "Görev Kontrol ile tüm kontrol listesini uygula, ısı kalkanı ve yakıtı doğrula", "en": "Run the full checklist with Mission Control, verify heat shield and fuel"},
-                "fx": {"f": -10, "m": 5}, "pts": 100,
-                "why": {"tr": "Kontrol listeleri hata payını azaltır; kritik aşamada atlama yapılmaz.", "en": "Checklists reduce error; nothing is skipped at a critical stage."},
-            },
-            {
-                "text": {"tr": "Zaman kazanmak için iki maddeyi atla", "en": "Skip two items to save time"},
-                "fx": {"f": -5, "m": -5}, "pts": 50,
-                "why": {"tr": "Küçük atlamalar büyük risklere dönüşebilir.", "en": "Small skips can turn into big risks."},
-            },
-            {
-                "text": {"tr": "Doğrulama yapmadan hemen girişe başla", "en": "Start re-entry immediately without verification"},
-                "fx": {"p": -20, "f": -20}, "pts": 0,
-                "why": {"tr": "Doğrulanmamış bir girişte hata geri alınamaz.", "en": "In an unverified re-entry, mistakes cannot be undone."},
-            },
-        ],
-    },
-]
-
-QUIZ = [
-    {
-        "q": {"tr": "Uzaya çıkan ilk insan kimdir?", "en": "Who was the first human in space?"},
-        "o": {"tr": ["Neil Armstrong", "Yuri Gagarin", "Buzz Aldrin"], "en": ["Neil Armstrong", "Yuri Gagarin", "Buzz Aldrin"]},
-        "a": 1,
-    },
-    {
-        "q": {"tr": "Ay'ın yerçekimi Dünya'nınkinin yaklaşık kaçta kaçıdır?", "en": "The Moon's gravity is about what fraction of Earth's?"},
-        "o": {"tr": ["Yaklaşık 1/2", "Yaklaşık 1/6", "Aynı"], "en": ["About 1/2", "About 1/6", "The same"]},
-        "a": 1,
-    },
-    {
-        "q": {"tr": "Uluslararası Uzay İstasyonu yaklaşık kaç km yükseklikte döner?", "en": "At roughly what altitude does the ISS orbit?"},
-        "o": {"tr": ["40 km", "4.000 km", "400 km"], "en": ["40 km", "4,000 km", "400 km"]},
-        "a": 2,
-    },
-    {
-        "q": {"tr": "Güneş ışığı Dünya'ya yaklaşık ne kadar sürede ulaşır?", "en": "How long does sunlight take to reach Earth?"},
-        "o": {"tr": ["Yaklaşık 8 dakika", "Yaklaşık 8 saat", "Yaklaşık 8 saniye"], "en": ["About 8 minutes", "About 8 hours", "About 8 seconds"]},
-        "a": 0,
-    },
-    {
-        "q": {"tr": "ISS'teki astronotlar neden ağırlıksız hisseder?", "en": "Why do astronauts on the ISS feel weightless?"},
-        "o": {
-            "tr": ["O yükseklikte yerçekimi yoktur", "Dünya etrafında sürekli serbest düşüş halindedirler", "İstasyon atmosferin dışındadır"],
-            "en": ["There is no gravity at that altitude", "They are in constant free fall around Earth", "The station is outside the atmosphere"],
-        },
-        "a": 1,
-    },
-]
-
-RANKS = [
-    (500, {"tr": "Komutan 🥇", "en": "Commander 🥇"}),
-    (350, {"tr": "Pilot 🥈", "en": "Pilot 🥈"}),
-    (200, {"tr": "Kadet 🥉", "en": "Cadet 🥉"}),
-    (0, {"tr": "Stajyer 🚀", "en": "Trainee 🚀"}),
-]
-
-# ----------------------------------------------------------------------------
-# STATE
-# ----------------------------------------------------------------------------
-ss = st.session_state
-ss.setdefault("lang", "tr")
-
-
-def reset_game():
-    ss.started = False
-    ss.step = 0
-    ss.stats = {"o": 100, "p": 100, "f": 100, "m": 100}
-    ss.score = 0
-    ss.history = []
-    ss.phase = "choose"
-    ss.failed = False
-    ss.order = [0, 1, 2]
-    ss.last = None
-
-
-if "started" not in ss:
-    reset_game()
-
-
-def tx(d):
-    return d[ss.lang] if isinstance(d, dict) else d
-
-
-def new_order():
-    order = [0, 1, 2]
-    random.shuffle(order)
-    ss.order = order
-
-
-def start_game():
-    ss.started = True
-    ss.step = 0
-    new_order()
-
-
-def choose(idx):
-    ch = EVENTS[ss.step]["choices"][idx]
-    for k, v in ch["fx"].items():
-        ss.stats[k] = max(0, min(100, ss.stats[k] + v))
-    ss.score += ch["pts"]
-    ss.history.append({"step": ss.step, "idx": idx})
-    ss.last = idx
-    ss.phase = "feedback"
-    if ss.stats["o"] <= 0 or ss.stats["p"] <= 0:
-        ss.failed = True
-
-
-def next_event():
-    ss.step += 1
-    if ss.failed or ss.step >= len(EVENTS):
-        ss.phase = "end"
-    else:
-        ss.phase = "choose"
-        new_order()
-
-
-def rank_of(score):
-    for threshold, name in RANKS:
-        if score >= threshold:
-            return tx(name)
-    return tx(RANKS[-1][1])
-
-
-def show_stats():
-    cols = st.columns(4)
-    items = [("o", "🫁", "oxygen"), ("p", "⚡", "power"), ("f", "⛽", "fuel"), ("m", "😊", "morale")]
-    for col, (key, icon, name) in zip(cols, items):
-        with col:
-            st.metric(f"{icon} {tx(UI[name])}", f"{ss.stats[key]}%")
-            st.progress(ss.stats[key] / 100)
-
-
-# ----------------------------------------------------------------------------
-# SIDEBAR + HEADER
-# ----------------------------------------------------------------------------
 with st.sidebar:
-    lang_choice = st.radio(
-        UI["language"][ss.lang],
-        ["tr", "en"],
-        index=0 if ss.lang == "tr" else 1,
-        format_func=lambda x: "Türkçe" if x == "tr" else "English",
-        horizontal=True,
+    st.selectbox("🌐 Language", LK, format_func=lambda k: LANGS[k][0], key="lang")
+
+if ss.lang == "ar":
+    st.markdown(
+        "<style>.stMarkdown, .stButton, label, p, h1, h2, h3 {direction: rtl; text-align: right;}</style>",
+        unsafe_allow_html=True,
     )
-    if lang_choice != ss.lang:
-        ss.lang = lang_choice
-        st.rerun()
-    if st.button(tx(UI["reset"])):
-        reset_game()
+
+prewarm(ALL_TEXTS)
+
+with st.sidebar:
+    st.markdown("### 🏅 " + T("Explorer badges"))
+    st.progress(len(ss.done) / len(BADGES))
+    st.write(" ".join(icon if key in ss.done else "🔒" for key, icon in BADGES.items()))
+    st.caption(T("Earn all 5 badges: finish the mission, build a working Moon base, find geostationary orbit, survive re-entry, land on Mars."))
+    if st.button("🔄 " + C("restart")):
+        for k in list(ss.keys()):
+            if k not in ("lang",):
+                del ss[k]
         st.rerun()
 
 st.markdown(
     f"""
     <div class="hero">
       <h1>🚀 ASTRA MISSION TRAINER</h1>
-      <p>{tx(UI['tagline'])}</p>
+      <p>{C('tagline')}</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-tab_mission, tab_academy, tab_about = st.tabs(
-    [tx(UI["tab_mission"]), tx(UI["tab_academy"]), tx(UI["tab_about"])]
-)
+if ss.lang != "en" and GoogleTranslator is None:
+    st.caption("Auto-translation package not installed. Core interface is translated; details are shown in English.")
 
-# ----------------------------------------------------------------------------
-# MISSION TAB
-# ----------------------------------------------------------------------------
-with tab_mission:
-    if not ss.started:
-        st.info(tx(UI["intro"]))
-        ss.callsign = st.text_input(tx(UI["callsign"]), value=ss.get("callsign", "Cadet"))
-        st.button(tx(UI["start"]), type="primary", on_click=start_game)
+tabs = st.tabs([
+    "🛰️ " + C("tab_mission"), "🌙 " + C("tab_base"), "🌍 " + C("tab_orbit"),
+    "🪐 " + C("tab_gravity"), "🫁 " + C("tab_life"), "🔥 " + C("tab_reentry"),
+    "🔴 " + C("tab_mars"),
+])
 
-    elif ss.phase in ("choose", "feedback"):
-        ev = EVENTS[ss.step]
-        st.caption(f"{tx(UI['event'])} {ss.step + 1}/{len(EVENTS)}  •  {tx(UI['score'])}: {ss.score}")
-        show_stats()
-        st.markdown(
-            f'<div class="event"><b>⚠️ {tx(ev["title"])}</b><br>{tx(ev["story"])}</div>',
-            unsafe_allow_html=True,
-        )
+# =============================================================================
+# 1) MISSION CAMPAIGN (random 6 of 10 emergencies, branching consequences)
+# =============================================================================
+def m_reset():
+    ss.m_started = False
+    ss.m_idx = []
+    ss.m_step = 0
+    ss.m_stats = {"o": 100, "p": 100, "f": 100, "m": 100}
+    ss.m_score = 0
+    ss.m_hist = []
+    ss.m_phase = "choose"
+    ss.m_failed = False
+    ss.m_order = [0, 1, 2]
+    ss.m_last = None
 
-        if ss.phase == "choose":
-            st.subheader(tx(UI["decide"]))
-            for idx in ss.order:
-                st.button(
-                    tx(ev["choices"][idx]["text"]),
-                    key=f"choice_{ss.step}_{idx}",
-                    on_click=choose,
-                    args=(idx,),
-                    use_container_width=True,
-                )
+
+if "m_started" not in ss:
+    m_reset()
+
+
+def m_new_order():
+    o = [0, 1, 2]
+    random.shuffle(o)
+    ss.m_order = o
+
+
+def m_start():
+    ss.m_started = True
+    ss.m_idx = random.sample(range(len(EVENTS)), 6)
+    ss.m_step = 0
+    ss.m_stats = {"o": 100, "p": 100, "f": 100, "m": 100}
+    ss.m_score = 0
+    ss.m_hist = []
+    ss.m_failed = False
+    ss.m_phase = "choose"
+    m_new_order()
+
+
+def m_choose(i):
+    ch = EVENTS[ss.m_idx[ss.m_step]]["choices"][i]
+    for k, v in ch["fx"].items():
+        ss.m_stats[k] = max(0, min(100, ss.m_stats[k] + v))
+    ss.m_score += ch["pts"]
+    ss.m_hist.append((ss.m_idx[ss.m_step], i))
+    ss.m_last = i
+    ss.m_phase = "feedback"
+    if ss.m_stats["o"] <= 0 or ss.m_stats["p"] <= 0:
+        ss.m_failed = True
+
+
+def m_next():
+    ss.m_step += 1
+    if ss.m_failed or ss.m_step >= 6:
+        ss.m_phase = "end"
+    else:
+        ss.m_phase = "choose"
+        m_new_order()
+
+
+def m_stats_view():
+    cols = st.columns(4)
+    items = [("o", "🫁", T("Oxygen")), ("p", "⚡", T("Power")), ("f", "⛽", T("Fuel")), ("m", "😊", T("Morale"))]
+    for col, (k, icon, name) in zip(cols, items):
+        with col:
+            st.metric(f"{icon} {name}", f"{ss.m_stats[k]}%")
+            st.progress(ss.m_stats[k] / 100)
+
+
+with tabs[0]:
+    if not ss.m_started:
+        st.info(T("Artemis-Junior mission: on the way home from lunar orbit, 6 random emergencies (out of 10) are waiting for you. If oxygen or power reaches zero, the mission fails. Every decision matters."))
+        ss.callsign = st.text_input(T("Your callsign"), value=ss.get("callsign", "Cadet"))
+        st.button("🚀 " + C("start"), type="primary", on_click=m_start)
+    elif ss.m_phase in ("choose", "feedback"):
+        e = EVENTS[ss.m_idx[ss.m_step]]
+        st.caption(f"{T('Event')} {ss.m_step + 1}/6  •  {T('Score')}: {ss.m_score}")
+        m_stats_view()
+        st.markdown(f'<div class="event"><b>⚠️ {T(e["title"])}</b><br>{T(e["story"])}</div>', unsafe_allow_html=True)
+        if ss.m_phase == "choose":
+            st.subheader(T("Make your decision:"))
+            for i in ss.m_order:
+                st.button(T(e["choices"][i]["text"]), key=f"mc_{ss.m_step}_{i}", on_click=m_choose, args=(i,), use_container_width=True)
         else:
-            ch = ev["choices"][ss.last]
+            ch = e["choices"][ss.m_last]
             icon = {100: "✅", 50: "⚠️", 0: "❌"}[ch["pts"]]
             box = {100: st.success, 50: st.warning, 0: st.error}[ch["pts"]]
-            box(f"{icon} **{tx(UI['result'])}:** {tx(ch['why'])}  (+{ch['pts']})")
-            st.markdown(
-                f'<div class="fact">🔭 {tx(ev["fact"])}</div>',
-                unsafe_allow_html=True,
-            )
-            last = ss.step >= len(EVENTS) - 1 or ss.failed
-            st.button(
-                tx(UI["finish"]) if last else tx(UI["next"]),
-                type="primary",
-                on_click=next_event,
-            )
-
-    else:  # end
-        if ss.failed:
-            st.error(tx(UI["fail"]))
+            box(f"{icon} {T(ch['why'])}  (+{ch['pts']})")
+            st.markdown(f'<div class="fact">🔭 {T(e["fact"])}</div>', unsafe_allow_html=True)
+            last = ss.m_step >= 5 or ss.m_failed
+            st.button(("📋 " + T("See mission debrief")) if last else ("➡️ " + C("next")), type="primary", on_click=m_next)
+    else:
+        if ss.m_failed:
+            st.error("💥 " + T("MISSION FAILED. Critical systems collapsed."))
         else:
-            st.success(tx(UI["success"]))
+            st.success("🎉 " + T("MISSION COMPLETE! The crew returned safely to Earth."))
             st.balloons()
-
-        show_stats()
+            mark("mission")
+        m_stats_view()
         c1, c2 = st.columns(2)
-        c1.metric(tx(UI["score"]), ss.score)
-        c2.metric(tx(UI["rank"]), rank_of(ss.score))
-
-        st.subheader(tx(UI["debrief"]))
-        for h in ss.history:
-            ev = EVENTS[h["step"]]
-            ch = ev["choices"][h["idx"]]
-            best = next(c for c in ev["choices"] if c["pts"] == 100)
+        c1.metric(T("Score"), ss.m_score)
+        c2.metric(T("Rank"), T(rank_of(ss.m_score)))
+        st.subheader("📋 " + T("Mission debrief"))
+        for ei, ci in ss.m_hist:
+            e = EVENTS[ei]
+            ch = e["choices"][ci]
+            best = e["choices"][0]
             icon = {100: "✅", 50: "⚠️", 0: "❌"}[ch["pts"]]
-            with st.expander(f"{icon} {tx(ev['title'])}"):
-                st.markdown(f"**{tx(UI['your_choice'])}:** {tx(ch['text'])}")
-                st.markdown(f"**{tx(UI['expert'])}:** {tx(best['text'])}")
-                st.caption(tx(best["why"]))
-
-        name = ss.get("callsign", "Cadet")
+            with st.expander(f"{icon} {T(e['title'])}"):
+                st.markdown(f"**{T('Your choice')}:** {T(ch['text'])}")
+                st.markdown(f"**{T('Expert approach')}:** {T(best['text'])}")
+                st.caption(T(best["why"]))
         cert = (
             "ASTRA MISSION TRAINER - CERTIFICATE\n"
-            f"Callsign: {name}\n"
-            f"Mission: Artemis-Junior\n"
-            f"Score: {ss.score}\n"
-            f"Rank: {rank_of(ss.score)}\n"
+            f"Callsign: {ss.get('callsign', 'Cadet')}\nMission: Artemis-Junior\n"
+            f"Score: {ss.m_score}\nRank: {rank_of(ss.m_score)}\n"
         )
-        st.download_button(tx(UI["cert"]), cert, file_name="astra_certificate.txt")
-        st.button(tx(UI["reset"]), key="restart_end", on_click=reset_game)
+        st.download_button("📥 " + T("Download certificate"), cert, file_name="astra_certificate.txt")
+        st.button("🔄 " + C("restart"), key="m_restart_end", on_click=m_reset)
 
-# ----------------------------------------------------------------------------
-# ACADEMY TAB
-# ----------------------------------------------------------------------------
-with tab_academy:
-    st.subheader(tx(UI["quiz_title"]))
-    answers = []
-    for i, q in enumerate(QUIZ):
-        opts = tx(q["o"])
-        answers.append(st.radio(tx(q["q"]), opts, index=None, key=f"quiz_{i}_{ss.lang}"))
+# =============================================================================
+# 2) MOON BASE BUILDER
+# =============================================================================
+with tabs[1]:
+    st.subheader("🌙 " + T("Moon Base Builder"))
+    st.write(T("Design a lunar base for your crew. Balance power, living space, food and water, then see if the base survives the lunar night. This is a simplified game model."))
+    site = st.selectbox(T("Base location"), [T("Polar ridge (short darkness, about 2 days)"), T("Equator (14-day night)")])
+    equator = site == T("Equator (14-day night)")
+    bc1, bc2 = st.columns(2)
+    crew_b = bc1.slider(T("Crew size"), 2, 8, 4, key="mb_crew")
+    panels = bc1.slider(T("Solar panel fields"), 0, 12, 4)
+    batts = bc1.slider(T("Battery banks"), 0, 12, 3)
+    habs = bc2.slider(T("Habitat modules"), 1, 6, 2)
+    farms = bc2.slider(T("Greenhouse modules"), 0, 6, 1)
+    rovers = bc2.slider(T("Ice-mining rovers"), 0, 6, 1)
 
-    if st.button(tx(UI["quiz_check"])):
-        correct = 0
-        for q, a in zip(QUIZ, answers):
-            opts = tx(q["o"])
-            right = opts[q["a"]]
-            if a == right:
-                correct += 1
-                st.success(f"{tx(q['q'])} → {tx(UI['correct'])}")
-            elif a is None:
-                st.info(f"{tx(q['q'])} → {tx(UI['quiz_pick'])}")
-            else:
-                st.error(f"{tx(q['q'])} → {tx(UI['wrong'])}: {right}")
-        st.metric(tx(UI["quiz_result"]), f"{correct}/{len(QUIZ)}")
+    gen = panels * 20.0
+    load = crew_b * 3.0 + habs * 2.0 + farms * 10.0 + rovers * 3.0
+    daylight_h = 354 if equator else 600
+    dark_h = 354 if equator else 48
+    stored = min(max(0.0, gen - load) * daylight_h, batts * 1000.0)
+    need_night = load * dark_h
+    day_ok = gen >= load
+    night_ok = stored >= need_night
+    space_ok = habs * 2 >= crew_b
+    food_frac = min(1.0, farms * 2 / crew_b)
+    water_frac = min(1.0, rovers * 2 / crew_b)
+    score = (40 if day_ok else int(40 * gen / load) if load else 0)
+    score += int(30 * min(1.0, stored / need_night)) if need_night else 30
+    score += 10 if space_ok else int(10 * habs * 2 / crew_b)
+    score += int(10 * food_frac) + int(10 * water_frac)
 
-# ----------------------------------------------------------------------------
-# ABOUT TAB
-# ----------------------------------------------------------------------------
-with tab_about:
-    if ss.lang == "tr":
-        st.markdown(
-            """
-**ASTRA MISSION TRAINER**, NASA Space Apps Challenge "Junior Astronaut Mission Trainer" için geliştirildi.
-
-**Amaç:** Gençlerin astronotluk, uzay bilimi, görev simülasyonu ve acil durumlarda karar verme becerilerini eğlenceli bir şekilde geliştirmesi.
-
-**Nasıl çalışır?**
-- Dallanan acil durum senaryoları: her karar oksijen, enerji, yakıt ve morali etkiler.
-- Görev sonunda debrief: ne yaptın, uzman ne yapardı.
-- Uzay Akademisi: kısa quiz.
-- Türkçe ve İngilizce arayüz.
-
-**Kaynaklar:** NASA'nın herkese açık bilgileri (Apollo 13, ISS, atmosfere giriş prosedürleri) eğitim amaçlı sadeleştirilerek kullanılmıştır. Senaryolar kurgusaldır ve gerçek görev prosedürlerinin yerine geçmez.
-            """
-        )
+    bm1, bm2, bm3 = st.columns(3)
+    bm1.metric(T("Power generated (kW)"), f"{gen:.0f}")
+    bm2.metric(T("Power used (kW)"), f"{load:.0f}")
+    bm3.metric(T("Base score"), f"{score}/100")
+    st.progress(min(score / 100, 1.0))
+    st.bar_chart(pd.DataFrame(
+        {T("Value"): [gen, load]}, index=[T("Power generated (kW)"), T("Power used (kW)")]))
+    st.write(("✅ " if day_ok else "❌ ") + T("Daytime power"))
+    st.write(("✅ " if night_ok else "❌ ") + T("Night power from batteries"))
+    st.write(("✅ " if space_ok else "❌ ") + T("Living space"))
+    st.write(f"🥬 {T('Food self-sufficiency')}: {food_frac * 100:.0f}%")
+    st.write(f"💧 {T('Water self-sufficiency')}: {water_frac * 100:.0f}%")
+    if day_ok and night_ok and space_ok and food_frac >= 0.5 and water_frac >= 0.5:
+        st.success("🌙 " + T("Your Moon base is safe and working! The crew can live there."))
+        mark("base")
     else:
-        st.markdown(
-            """
-**ASTRA MISSION TRAINER** was built for the NASA Space Apps Challenge "Junior Astronaut Mission Trainer".
+        st.info(T("Fix the items marked with a red X to make the base work."))
 
-**Goal:** Help young people build skills in astronaut training, space science, mission simulation and emergency decision-making in a fun way.
+# =============================================================================
+# 3) ORBIT LAB
+# =============================================================================
+MU = 3.986004418e14  # m^3/s^2
+RE = 6371.0  # km
 
-**How it works:**
-- Branching emergency scenarios: every decision affects oxygen, power, fuel and morale.
-- End-of-mission debrief: what you did and what an expert would do.
-- Space Academy: a short quiz.
-- Turkish and English interface.
 
-**Sources:** Public NASA information (Apollo 13, ISS, re-entry procedures) simplified for education. Scenarios are fictional and do not replace real mission procedures.
-            """
-        )
+def orbit_chart(r_km):
+    th = np.linspace(0, 2 * np.pi, 240)
+    n = len(th)
+    df = pd.concat([
+        pd.DataFrame({"x": RE * np.cos(th), "y": RE * np.sin(th), "body": "Earth", "i": range(n)}),
+        pd.DataFrame({"x": r_km * np.cos(th), "y": r_km * np.sin(th), "body": "Orbit", "i": range(n)}),
+    ])
+    lim = r_km * 1.1
+    return (
+        alt.Chart(df).mark_line(strokeWidth=3).encode(
+            x=alt.X("x:Q", scale=alt.Scale(domain=[-lim, lim]), axis=None),
+            y=alt.Y("y:Q", scale=alt.Scale(domain=[-lim, lim]), axis=None),
+            color=alt.Color("body:N", scale=alt.Scale(domain=["Earth", "Orbit"], range=["#4b8bff", "#ff9f43"]), legend=None),
+            order="i:Q",
+        ).properties(width=320, height=320)
+    )
+
+
+def set_alt(v):
+    ss.orb_alt = v
+
+
+with tabs[2]:
+    st.subheader("🌍 " + T("Orbit Lab"))
+    st.write(T("Higher orbits are slower and take longer. Challenge: find the altitude where a satellite stays above the same spot on Earth (a 24-hour orbit)."))
+    b1, b2, b3 = st.columns(3)
+    b1.button("🛰️ ISS (400 km)", on_click=set_alt, args=(400,), use_container_width=True)
+    b2.button("📡 GPS (20,200 km)", on_click=set_alt, args=(20200,), use_container_width=True)
+    b3.button("🎯 " + T("Try 36,000 km"), on_click=set_alt, args=(36000,), use_container_width=True)
+    h = st.slider(T("Orbit altitude (km)"), 200, 45000, step=50, key="orb_alt")
+    r = RE + h
+    v = math.sqrt(MU / (r * 1000)) / 1000
+    period_s = 2 * math.pi * math.sqrt((r * 1000) ** 3 / MU)
+    o1, o2, o3 = st.columns(3)
+    o1.metric(T("Orbital speed (km/s)"), f"{v:.2f}")
+    o2.metric(T("Period (hours)"), f"{period_s / 3600:.2f}")
+    o3.metric(T("Orbits per day"), f"{86400 / period_s:.2f}")
+    left, right = st.columns([1, 1])
+    with left:
+        st.altair_chart(orbit_chart(r), use_container_width=False)
+    with right:
+        hs = np.linspace(200, 45000, 120)
+        per = [2 * math.pi * math.sqrt(((RE + x) * 1000) ** 3 / MU) / 3600 for x in hs]
+        st.line_chart(pd.DataFrame({T("Period (hours)"): per}, index=hs))
+        st.caption(T("Orbit period vs altitude (km)"))
+    if abs(h - 35786) <= 300:
+        st.success("🎯 " + T("Geostationary orbit found! The satellite orbits once every 24 hours, so it hovers over one spot."))
+        mark("orbit")
+
+# =============================================================================
+# 4) GRAVITY LAB
+# =============================================================================
+with tabs[3]:
+    st.subheader("🪐 " + T("Gravity Lab"))
+    st.write(T("See how much you would weigh on other worlds and how high you could jump."))
+    g1, g2 = st.columns(2)
+    mass = g1.slider(T("Your mass (kg)"), 20, 120, 50)
+    body = g2.selectbox(T("Choose a world"), list(BODIES), index=3, format_func=T)
+    g = BODIES[body]
+    w_eq = mass * g / 9.80665
+    gm1, gm2, gm3 = st.columns(3)
+    gm1.metric(T("Weight (newtons)"), f"{mass * g:.0f}")
+    gm2.metric(T("Feels like (kg on Earth)"), f"{w_eq:.1f}")
+    gm3.metric(T("Jump height (an Earth 0.5 m jump)"), f"{0.5 * 9.81 / g:.1f} m")
+    df = pd.DataFrame({T("Feels like (kg on Earth)"): [mass * x / 9.80665 for x in BODIES.values()]}, index=[T(n) for n in BODIES])
+    st.bar_chart(df)
+
+# =============================================================================
+# 5) LIFE SUPPORT PLANNER
+# =============================================================================
+with tabs[4]:
+    st.subheader("🫁 " + T("Life Support Planner"))
+    st.write(T("Plan supplies for a mission. Values are approximate planning numbers per person per day."))
+    l1, l2, l3 = st.columns(3)
+    crew = l1.slider(T("Crew size"), 1, 8, 4)
+    days = l2.slider(T("Mission length (days)"), 1, 1000, 180)
+    rec = l3.slider(T("Water recycling (%)"), 0, 98, 90)
+    o2 = 0.84 * crew * days
+    water_total = 3.5 * crew * days
+    water_launch = water_total * (1 - rec / 100)
+    food = 1.8 * crew * days
+    co2 = 1.0 * crew * days
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(T("Oxygen needed (kg)"), f"{o2:,.0f}")
+    k2.metric(T("Water to launch (kg)"), f"{water_launch:,.0f}")
+    k3.metric(T("Food (kg)"), f"{food:,.0f}")
+    k4.metric(T("CO2 to remove (kg)"), f"{co2:,.0f}")
+    df = pd.DataFrame({T("Mass (kg)"): [o2, water_launch, food]}, index=[T("Oxygen"), T("Water"), T("Food")])
+    st.bar_chart(df)
+    saved = water_total - water_launch
+    st.info(T("Water saved by recycling (kg)") + f": {saved:,.0f}")
+    st.caption(T("Recycling is why long missions like a trip to Mars need a closed-loop life support system."))
+
+# =============================================================================
+# 6) RE-ENTRY LAB
+# =============================================================================
+with tabs[5]:
+    st.subheader("🔥 " + T("Re-entry Lab"))
+    st.write(T("Choose the entry angle. Too shallow and the capsule bounces off the atmosphere. Too steep and heat and g-forces become dangerous. This is a simplified model."))
+    ang = st.slider(T("Entry angle (degrees)"), 3.0, 12.0, 6.5, 0.1)
+    peak_g = (ang ** 1.6) / 4.0
+    temp = 2760 * math.sqrt(ang / 6.5)
+    r1, r2 = st.columns(2)
+    r1.metric(T("Peak g-force"), f"{peak_g:.1f} g")
+    r2.metric(T("Heat shield temperature (C)"), f"{temp:,.0f}")
+    xs = np.linspace(3, 12, 90)
+    gdf = pd.DataFrame({"angle": xs, "g": (xs ** 1.6) / 4.0})
+    band = pd.DataFrame({"a": [5.2], "b": [7.4]})
+    chart = (
+        alt.Chart(band).mark_rect(opacity=0.2, color="green").encode(x="a:Q", x2="b:Q")
+        + alt.Chart(gdf).mark_line(color="#ff9f43").encode(x=alt.X("angle:Q", title=T("Entry angle (degrees)")), y=alt.Y("g:Q", title="g"))
+        + alt.Chart(pd.DataFrame({"x": [ang]})).mark_rule(color="red").encode(x="x:Q")
+    ).properties(height=260)
+    st.altair_chart(chart, use_container_width=True)
+    st.caption(T("Green band: safe entry corridor."))
+    if ang < 5.2:
+        st.error("↗️ " + T("Too shallow! The capsule skips off the atmosphere and cannot return."))
+    elif ang <= 7.4:
+        st.success("✅ " + T("Perfect entry! The crew is safe."))
+        mark("reentry")
+    elif ang <= 9.5:
+        st.warning("⚠️ " + T("Too steep! Very high g-force and heat. The crew is in danger."))
+    else:
+        st.error("💥 " + T("Far too steep! The capsule is destroyed."))
+
+# =============================================================================
+# 7) MARS LANDING (turn-based lander)
+# =============================================================================
+def ml_reset():
+    ss.ml = {"alt": 1000.0, "v": -80.0, "fuel": 100.0, "t": 0, "hist": [(0, 1000.0)], "status": "flying"}
+
+
+def ml_step():
+    m = ss.ml
+    if m["status"] != "flying":
+        return
+    b = ss.get("burn", 0) / 100
+    use = b * 6
+    if use > m["fuel"]:
+        use = m["fuel"]
+        b = use / 6
+    m["fuel"] -= use
+    a = -3.71 + b * 12
+    v_new = m["v"] + a * 2
+    alt_new = m["alt"] + (m["v"] + v_new) / 2 * 2
+    m["t"] += 2
+    m["v"] = v_new
+    if alt_new <= 0:
+        m["alt"] = 0.0
+        m["status"] = "landed" if abs(v_new) <= 3 else "crashed"
+    else:
+        m["alt"] = alt_new
+    m["hist"].append((m["t"], m["alt"]))
+
+
+if "ml" not in ss:
+    ml_reset()
+
+with tabs[6]:
+    st.subheader("🔴 " + T("Mars Landing"))
+    st.write(T("Land softly on Mars! Each turn lasts 2 seconds. Set the engine power, then burn. Touch down slower than 3 m/s. Do not run out of fuel."))
+    m = ss.ml
+    q1, q2, q3 = st.columns(3)
+    q1.metric(T("Altitude (m)"), f"{m['alt']:.0f}")
+    q2.metric(T("Speed (m/s)"), f"{m['v']:.1f}")
+    q3.metric(T("Fuel"), f"{m['fuel']:.0f}%")
+    st.progress(max(0.0, min(m["fuel"] / 100, 1.0)))
+    if m["status"] == "flying":
+        st.slider(T("Engine power (%)"), 0, 100, 0, 10, key="burn")
+        st.button("🔥 " + T("Burn for 2 seconds"), type="primary", on_click=ml_step)
+    elif m["status"] == "landed":
+        st.success("🎉 " + T("Touchdown! Soft landing on Mars."))
+        mark("mars")
+    else:
+        st.error("💥 " + T("Crash! You hit the surface too fast."))
+    hdf = pd.DataFrame(m["hist"], columns=["t", "alt"]).set_index("t")
+    st.line_chart(hdf)
+    st.button("🔄 " + C("restart"), key="ml_restart", on_click=ml_reset)
+
+st.divider()
+st.caption(T("Built for the NASA Space Apps Challenge. Scenarios and models are simplified and fictional, not real mission procedures."))
