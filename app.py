@@ -381,6 +381,13 @@ div.stButton > button:hover {box-shadow: 0 0 14px rgba(122,162,255,.8); border-c
 .stApp [data-testid="stSlider"] [data-testid="stTickBarMin"], .stApp [data-testid="stSlider"] [data-testid="stTickBarMax"] {color: #b9c8ff !important;}
 .stApp [data-testid="stAlert"] {background: rgba(20,32,80,.55) !important; border: 1px solid rgba(122,162,255,.35);}
 .stApp [data-testid="stDataFrame"] {filter: invert(0);}
+html {color-scheme: dark !important;}
+.stApp, .stApp * {color: #e8ecff !important;}
+.stApp [data-testid="stMetricLabel"] p, .stApp [data-testid="stMetricLabel"] {color: #b9c8ff !important;}
+.stApp [data-testid="stMetricValue"], .stApp [data-testid="stMetricValue"] * {color: #7fffd4 !important;}
+.stApp input::placeholder, .stApp textarea::placeholder {color: #9fb0e8 !important; opacity: 1 !important;}
+.stApp [data-baseweb="select"] *, .stApp input, .stApp textarea {color: #ffffff !important;}
+.stApp a {color: #8fb4ff !important;}
 </style>
 """
 st.markdown(_CSS.replace("__BG__", ", ".join(_layers)).replace("__SZ__", ", ".join(_sizes)), unsafe_allow_html=True)
@@ -686,7 +693,7 @@ with tabs[3]:
     st.markdown("#### 🎂 " + T("Your age on other planets"))
     age = st.slider(T("Your age (Earth years)"), 5, 100, 14)
     adf = pd.DataFrame({T("Age (planet years)"): [round(age / y, 2) for y in YEARS.values()]}, index=[T(n) for n in YEARS])
-    st.dataframe(adf, use_container_width=True)
+    bar_chart(adf)
 
 # =============================================================================
 # 5) LIFE SUPPORT PLANNER
