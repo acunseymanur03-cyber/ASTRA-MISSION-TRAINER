@@ -275,6 +275,29 @@ def mark(key):
     ss.done.add(key)
 
 
+def show_chart(ch, container=True):
+    ch = ch.configure(background="transparent").configure_axis(
+        labelColor="#dbe4ff", titleColor="#dbe4ff", gridColor="#2a3a7a",
+        domainColor="#7aa2ff", tickColor="#7aa2ff",
+    ).configure_view(strokeWidth=0)
+    st.altair_chart(ch, use_container_width=container, theme=None)
+
+
+def bar_chart(df):
+    d = df.reset_index().iloc[:, :2]
+    d.columns = ["x", "y"]
+    show_chart(alt.Chart(d).mark_bar(color="#4b8bff").encode(
+        x=alt.X("x:N", sort=None, title=None, axis=alt.Axis(labelAngle=-35)),
+        y=alt.Y("y:Q", title=None), tooltip=["x", "y"]).properties(height=280))
+
+
+def line_chart(df):
+    d = df.reset_index().iloc[:, :2]
+    d.columns = ["x", "y"]
+    show_chart(alt.Chart(d).mark_line(color="#ff9f43", strokeWidth=3).encode(
+        x=alt.X("x:Q", title=None), y=alt.Y("y:Q", title=None)).properties(height=240))
+
+
 # ---- collect every string that should be pre-translated -----------------------
 try:
     with open(__file__, encoding="utf-8") as _f:
@@ -343,6 +366,21 @@ div.stButton > button:hover {box-shadow: 0 0 14px rgba(122,162,255,.8); border-c
 @keyframes blink {50% {opacity:.25;}}
 .event {padding: 1rem 1.2rem; border-left: 5px solid #ff4b4b; background: rgba(255,75,75,.12); border-radius: 8px; margin: .6rem 0;}
 .fact {padding: .7rem 1rem; border-left: 5px solid #4b8bff; background: rgba(75,139,255,.12); border-radius: 8px; margin: .6rem 0;}
+.stApp :is(p, span, label, li, small, h1, h2, h3, h4, h5, h6, td, th, summary, div[data-testid="stMarkdownContainer"],
+  div[data-testid="stMetricValue"], div[data-testid="stMetricLabel"], div[data-testid="stCaptionContainer"],
+  div[data-testid="stWidgetLabel"]) {color: #e8ecff !important;}
+.stApp [data-testid="stMetricLabel"] p {color: #b9c8ff !important;}
+.stApp [data-testid="stMetricValue"] {color: #7fffd4 !important;}
+.stApp [data-baseweb="select"] > div, .stApp [data-baseweb="input"], .stApp [data-baseweb="base-input"],
+.stApp input, .stApp textarea {background-color: rgba(20,32,80,.85) !important; color: #ffffff !important; border-color: rgba(122,162,255,.5) !important;}
+.stApp [data-baseweb="select"] *, .stApp [data-baseweb="tag"] span {color: #ffffff !important;}
+[data-baseweb="popover"] > div, [data-baseweb="popover"] ul, [data-baseweb="menu"], ul[role="listbox"] {background: #0c1230 !important;}
+[data-baseweb="popover"] li, [data-baseweb="popover"] li * , [data-baseweb="menu"] li, ul[role="listbox"] li {color: #ffffff !important; background: transparent !important;}
+[data-baseweb="popover"] li:hover, ul[role="listbox"] li:hover {background: rgba(75,139,255,.45) !important;}
+.stApp [data-testid="stExpander"] details {background: rgba(20,32,80,.45); border: 1px solid rgba(122,162,255,.35); border-radius: 10px;}
+.stApp [data-testid="stSlider"] [data-testid="stTickBarMin"], .stApp [data-testid="stSlider"] [data-testid="stTickBarMax"] {color: #b9c8ff !important;}
+.stApp [data-testid="stAlert"] {background: rgba(20,32,80,.55) !important; border: 1px solid rgba(122,162,255,.35);}
+.stApp [data-testid="stDataFrame"] {filter: invert(0);}
 </style>
 """
 st.markdown(_CSS.replace("__BG__", ", ".join(_layers)).replace("__SZ__", ", ".join(_sizes)), unsafe_allow_html=True)
@@ -557,7 +595,7 @@ with tabs[1]:
     bm2.metric(T("Power used (kW)"), f"{load:.0f}")
     bm3.metric(T("Base score"), f"{score}/100")
     st.progress(min(score / 100, 1.0))
-    st.bar_chart(pd.DataFrame(
+    bar_chart(pd.DataFrame(
         {T("Value"): [gen, load]}, index=[T("Power generated (kW)"), T("Power used (kW)")]))
     st.write(("✅ " if day_ok else "❌ ") + T("Daytime power"))
     st.write(("✅ " if night_ok else "❌ ") + T("Night power from batteries"))
@@ -616,11 +654,11 @@ with tabs[2]:
     o3.metric(T("Orbits per day"), f"{86400 / period_s:.2f}")
     left, right = st.columns([1, 1])
     with left:
-        st.altair_chart(orbit_chart(r), use_container_width=False)
+        show_chart(orbit_chart(r), False)
     with right:
         hs = np.linspace(200, 45000, 120)
         per = [2 * math.pi * math.sqrt(((RE + x) * 1000) ** 3 / MU) / 3600 for x in hs]
-        st.line_chart(pd.DataFrame({T("Period (hours)"): per}, index=hs))
+        line_chart(pd.DataFrame({T("Period (hours)"): per}, index=hs))
         st.caption(T("Orbit period vs altitude (km)"))
     if abs(h - 35786) <= 300:
         st.success("🎯 " + T("Geostationary orbit found! The satellite orbits once every 24 hours, so it hovers over one spot."))
@@ -642,7 +680,7 @@ with tabs[3]:
     gm2.metric(T("Feels like (kg on Earth)"), f"{w_eq:.1f}")
     gm3.metric(T("Jump height (an Earth 0.5 m jump)"), f"{0.5 * 9.81 / g:.1f} m")
     df = pd.DataFrame({T("Feels like (kg on Earth)"): [mass * x / 9.80665 for x in BODIES.values()]}, index=[T(n) for n in BODIES])
-    st.bar_chart(df)
+    bar_chart(df)
 
     st.markdown("---")
     st.markdown("#### 🎂 " + T("Your age on other planets"))
@@ -671,7 +709,7 @@ with tabs[4]:
     k3.metric(T("Food (kg)"), f"{food:,.0f}")
     k4.metric(T("CO2 to remove (kg)"), f"{co2:,.0f}")
     df = pd.DataFrame({T("Mass (kg)"): [o2, water_launch, food]}, index=[T("Oxygen"), T("Water"), T("Food")])
-    st.bar_chart(df)
+    bar_chart(df)
     saved = water_total - water_launch
     st.info(T("Water saved by recycling (kg)") + f": {saved:,.0f}")
     st.caption(T("Recycling is why long missions like a trip to Mars need a closed-loop life support system."))
@@ -696,7 +734,7 @@ with tabs[5]:
         + alt.Chart(gdf).mark_line(color="#ff9f43").encode(x=alt.X("angle:Q", title=T("Entry angle (degrees)")), y=alt.Y("g:Q", title="g"))
         + alt.Chart(pd.DataFrame({"x": [ang]})).mark_rule(color="red").encode(x="x:Q")
     ).properties(height=260)
-    st.altair_chart(chart, use_container_width=True)
+    show_chart(chart, True)
     st.caption(T("Green band: safe entry corridor."))
     if ang < 5.2:
         st.error("↗️ " + T("Too shallow! The capsule skips off the atmosphere and cannot return."))
@@ -759,7 +797,7 @@ with tabs[6]:
     else:
         st.error("💥 " + T("Crash! You hit the surface too fast."))
     hdf = pd.DataFrame(m["hist"], columns=["t", "alt"]).set_index("t")
-    st.line_chart(hdf)
+    line_chart(hdf)
     st.button("🔄 " + C("restart"), key="ml_restart", on_click=ml_reset)
 
 # =============================================================================
@@ -789,7 +827,7 @@ with tabs[7]:
                             "name": [T(n) for n in ("Mercury", "Venus", "Earth", "Mars", "Jupiter")]})
         chart += alt.Chart(sol).mark_point(size=60, color="#9bb7ff").encode(x=alt.X("x:Q", scale=xs_), y=alt.Y("y:Q", axis=None))
         chart += alt.Chart(sol).mark_text(dy=-16, color="#ffffff").encode(x=alt.X("x:Q", scale=xs_), y=alt.Y("y:Q", axis=None), text="name:N")
-    st.altair_chart(chart.properties(height=220), use_container_width=True)
+    show_chart(chart.properties(height=220), True)
     if hz_in <= dist <= hz_out:
         st.success("🌱 " + T("In the habitable zone! Liquid water could exist here."))
         mark("exo")
@@ -827,7 +865,7 @@ with tabs[8]:
     dchart = alt.Chart(ldf).mark_line(color="#ff9f43").encode(
         x=alt.X("years:Q", title=T("Warning time (years)")), y=alt.Y("km:Q", title="km"))
     dchart += alt.Chart(pd.DataFrame({"km": [NEED_KM]})).mark_rule(color="red").encode(y="km:Q")
-    st.altair_chart(dchart.properties(height=240), use_container_width=True)
+    show_chart(dchart.properties(height=240), True)
     st.caption(T("Red line: about one Earth radius (6,371 km), enough to miss Earth."))
     if shift_km >= NEED_KM:
         st.success("🛡️ " + T("Earth is safe! The asteroid will miss us."))
@@ -882,3 +920,4 @@ with tabs[9]:
 
 st.divider()
 st.caption(T("Independent educational project created for the NASA Space Apps Challenge. Not affiliated with or endorsed by NASA. Scenarios and models are simplified and fictional."))
+
