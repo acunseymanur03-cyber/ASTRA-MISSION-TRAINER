@@ -343,8 +343,8 @@ _CSS = """
 html, body {background-color:#02030a !important; background-image: __BG__ !important;
   background-size: __SZ__ !important; background-repeat: repeat !important; background-attachment: fixed !important;}
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stToolbar"] {background: transparent !important;}
-[data-testid="stSidebar"] > div:first-child {background: rgba(6,10,32,.84) !important; backdrop-filter: blur(6px);}
-.block-container, [data-testid="stMainBlockContainer"] {background: rgba(4,8,26,.58); border:1px solid rgba(122,162,255,.20);
+[data-testid="stSidebar"] > div:first-child {background: rgba(6,10,32,.97) !important; backdrop-filter: blur(6px);}
+.block-container, [data-testid="stMainBlockContainer"] {background: rgba(4,8,26,.94); border:1px solid rgba(122,162,255,.20);
   border-radius:18px; padding: 1.4rem 2rem 3rem !important; margin-top:.8rem; backdrop-filter: blur(5px); max-width: 1250px;}
 h1, h2, h3, h4 {font-family:'Orbitron', sans-serif !important; letter-spacing:.5px;}
 [data-testid="stMetric"] {background: rgba(20,32,80,.55); border:1px solid rgba(122,162,255,.30); border-radius:12px; padding:10px 14px;}
@@ -388,6 +388,9 @@ html {color-scheme: dark !important;}
 .stApp input::placeholder, .stApp textarea::placeholder {color: #9fb0e8 !important; opacity: 1 !important;}
 .stApp [data-baseweb="select"] *, .stApp input, .stApp textarea {color: #ffffff !important;}
 .stApp a {color: #8fb4ff !important;}
+.stApp :is(p, span, label, small, li, h1, h2, h3, h4, h5, h6, summary,
+  [data-testid="stCaptionContainer"], [data-testid="stMetricLabel"], [data-testid="stMetricValue"],
+  button[role="tab"], button[role="tab"] p) {opacity: 1 !important; text-shadow: 0 1px 2px rgba(0,0,0,.9);}
 </style>
 """
 st.markdown(_CSS.replace("__BG__", ", ".join(_layers)).replace("__SZ__", ", ".join(_sizes)), unsafe_allow_html=True)
@@ -404,6 +407,7 @@ if ss.lang == "ar":
 prewarm(ALL_TEXTS)
 
 with st.sidebar:
+    st.checkbox("🔆 " + T("High contrast"), key="hc")
     st.markdown("### 🏅 " + T("Explorer badges"))
     st.progress(len(ss.done) / len(BADGES))
     st.write(" ".join(icon if key in ss.done else "🔒" for key, icon in BADGES.items()))
@@ -422,6 +426,14 @@ with st.sidebar:
             if k not in ("lang",):
                 del ss[k]
         st.rerun()
+
+if ss.get("hc"):
+    st.markdown(
+        "<style>html, body {background-image: none !important; background-color: #02030a !important;}"
+        ".block-container, [data-testid=\"stMainBlockContainer\"] {background: #050a22 !important; backdrop-filter: none !important;}"
+        "[data-testid=\"stMetric\"] {background: #0c1640 !important;}</style>",
+        unsafe_allow_html=True,
+    )
 
 st.markdown(
     f"""
@@ -927,4 +939,3 @@ with tabs[9]:
 
 st.divider()
 st.caption(T("Independent educational project created for the NASA Space Apps Challenge. Not affiliated with or endorsed by NASA. Scenarios and models are simplified and fictional."))
-
