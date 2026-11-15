@@ -1,6 +1,7 @@
 import math
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -61,6 +62,9 @@ CORE = {
     "tab_life": _core("Life Support", "Yaşam Destek", "Soporte vital", "Survie", "Lebenserhaltung", "Suporte vital", "دعم الحياة", "Жизнеобеспечение", "生命保障", "生命維持", "जीवन समर्थन"),
     "tab_reentry": _core("Re-entry", "Dönüş", "Reentrada", "Rentrée", "Wiedereintritt", "Reentrada", "العودة", "Возвращение", "再入", "再突入", "पुनःप्रवेश"),
     "tab_mars": _core("Mars Landing", "Mars İniş", "Aterrizaje en Marte", "Atterrissage Mars", "Mars-Landung", "Pouso em Marte", "الهبوط على المريخ", "Посадка на Марс", "火星着陆", "火星着陸", "मंगल लैंडिंग"),
+    "tab_exo": _core("Exoplanets", "Ötegezegen", "Exoplanetas", "Exoplanètes", "Exoplaneten", "Exoplanetas", "الكواكب الخارجية", "Экзопланеты", "系外行星", "系外惑星", "बहिर्ग्रह"),
+    "tab_defense": _core("Planet Defense", "Gezegen Savunması", "Defensa planetaria", "Défense planétaire", "Planetenabwehr", "Defesa planetária", "الدفاع الكوكبي", "Защита планеты", "行星防御", "惑星防衛", "ग्रह रक्षा"),
+    "tab_moon": _core("Moon Phases", "Ay Evreleri", "Fases lunares", "Phases lunaires", "Mondphasen", "Fases da Lua", "أطوار القمر", "Фазы Луны", "月相", "月の満ち欠け", "चंद्र कलाएँ"),
     "tab_academy": _core("Academy", "Akademi", "Academia", "Académie", "Akademie", "Academia", "الأكاديمية", "Академия", "学院", "アカデミー", "अकादमी"),
     "restart": _core("Restart", "Baştan başla", "Reiniciar", "Recommencer", "Neustart", "Reiniciar", "إعادة البدء", "Заново", "重新开始", "最初から", "फिर से शुरू"),
     "start": _core("Launch mission", "Göreve başla", "Iniciar misión", "Lancer la mission", "Mission starten", "Iniciar missão", "ابدأ المهمة", "Начать миссию", "开始任务", "ミッション開始", "मिशन शुरू करें"),
@@ -92,32 +96,46 @@ def _translate_one(text, lang):
     """Runs in worker threads: must NOT touch st.session_state."""
     if GoogleTranslator is None:
         return None
+    for attempt in range(2):
+        try:
+            out = GoogleTranslator(source="en", target=LANGS[lang][1]).translate(text)
+            if out:
+                return out
+        except Exception:
+            time.sleep(0.6)
+    return None
+
+
+def _translate_many(texts, lang):
+    """Translate many strings in ONE request (joined by newlines); split on mismatch."""
+    if not texts or GoogleTranslator is None:
+        return {}
+    if len(texts) == 1:
+        r = _translate_one(texts[0], lang)
+        return {texts[0]: r} if r else {}
     try:
-        out = GoogleTranslator(source="en", target=LANGS[lang][1]).translate(text)
-        return out or None
+        res = GoogleTranslator(source="en", target=LANGS[lang][1]).translate("\n".join(texts))
     except Exception:
-        return None
+        time.sleep(1.0)
+        return {}
+    parts = (res or "").split("\n")
+    if len(parts) == len(texts) and all(p.strip() for p in parts):
+        return dict(zip(texts, parts))
+    mid = len(texts) // 2
+    out = _translate_many(texts[:mid], lang)
+    out.update(_translate_many(texts[mid:], lang))
+    return out
 
 
 def T(text):
-    lang = ss.lang
-    if lang == "en" or not text or not text.strip():
+    """Lookup only (fast). Strings are translated in prewarm() / background thread."""
+    if ss.lang == "en" or not text:
         return text
-    s = _store()
-    hit = s["d"].get((lang, text))
-    if hit:
-        return hit
-    if GoogleTranslator is None or time.time() < s["blocked_until"]:
-        return text
-    out = _translate_one(text, lang)
-    if out:
-        s["d"][(lang, text)] = out
-        s["fails"] = 0
-        return out
-    s["fails"] += 1
-    if s["fails"] >= 3:
-        s["blocked_until"] = time.time() + 120
-    return text
+    return _store()["d"].get((ss.lang, text), text)
+
+
+def _chunks(items, n):
+    return [items[i:i + n] for i in range(0, len(items), n)]
 
 
 def prewarm(texts):
@@ -131,16 +149,26 @@ def prewarm(texts):
     if not todo:
         return
     with st.spinner("🌐 ..."):
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            results = list(ex.map(lambda t: _translate_one(t, lang), todo))
-    ok = 0
-    for t, r in zip(todo, results):
-        if r:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(lambda c: _translate_many(c, lang), _chunks(todo, 12)))
+    got = 0
+    for res in results:
+        for t, r in res.items():
             s["d"][(lang, t)] = r
-            ok += 1
-    if ok == 0:
-        s["fails"] = 3
-        s["blocked_until"] = time.time() + 120
+            got += 1
+    if got == 0:
+        s["blocked_until"] = time.time() + 15
+
+
+def _bg_warm(texts):
+    """Pre-translate every language once per server start so visitors get instant results."""
+    s = _store()
+    for lang in LK[1:]:
+        todo = [t for t in texts if (lang, t) not in s["d"]]
+        for chunk in _chunks(todo, 12):
+            for t, r in _translate_many(chunk, lang).items():
+                s["d"][(lang, t)] = r
+            time.sleep(0.3)
 
 
 # =============================================================================
@@ -226,8 +254,12 @@ BODIES = {
 }
 
 BADGES = {
-    "mission": "🛰️", "base": "🌙", "orbit": "🌍", "reentry": "🔥", "mars": "🔴",
+    "mission": "🛰️", "base": "🌙", "orbit": "🌍", "reentry": "🔥", "mars": "🔴", "exo": "🔭", "defense": "☄️",
 }
+
+STARS = {"Red dwarf": 0.04, "Sun-like star": 1.0, "Bright white star": 5.0}  # luminosity vs Sun
+YEARS = {"Mercury": 0.2408, "Venus": 0.6152, "Earth": 1.0, "Mars": 1.8808, "Jupiter": 11.862, "Saturn": 29.457, "Uranus": 84.02, "Neptune": 164.8}
+PHASE_NAMES = ["New Moon", "Waxing Crescent", "First Quarter", "Waxing Gibbous", "Full Moon", "Waning Gibbous", "Last Quarter", "Waning Crescent"]
 
 RANKS = [(500, "Commander 🥇"), (350, "Pilot 🥈"), (200, "Cadet 🥉"), (0, "Trainee 🚀")]
 
@@ -249,32 +281,71 @@ try:
         _src = _f.read()
 except Exception:
     _src = ""
-ALL_TEXTS = re.findall(r'\bT\(\s*"([^"\n]+)"\s*\)', _src)
+ALL_TEXTS = [a or b for a, b in re.findall(r'\bT\(\s*(?:"([^"\n]+)"|\'([^\'\n]+)\')\s*\)', _src)]
 for _e in EVENTS:
     ALL_TEXTS += [_e["title"], _e["story"], _e["fact"]]
     for _c in _e["choices"]:
         ALL_TEXTS += [_c["text"], _c["why"]]
-ALL_TEXTS += list(BODIES) + [n for _, n in RANKS]
+ALL_TEXTS += list(BODIES) + [n for _, n in RANKS] + list(STARS) + PHASE_NAMES
+ALL_TEXTS = list(dict.fromkeys(ALL_TEXTS))
+
+_s0 = _store()
+if not _s0.get("bg") and GoogleTranslator is not None:
+    _s0["bg"] = True
+    threading.Thread(target=_bg_warm, args=(list(ALL_TEXTS),), daemon=True).start()
 
 # =============================================================================
 # STYLE + SIDEBAR
 # =============================================================================
-st.markdown(
-    """
-    <style>
-    .hero {padding: 1.2rem 1.4rem; border-radius: 16px;
-           background: linear-gradient(135deg,#0b1026 0%,#1b2a6b 55%,#4b2a7b 100%);
-           color: #fff; margin-bottom: 1rem;}
-    .hero h1 {margin: 0; font-size: 1.9rem; letter-spacing: 2px; color:#fff;}
-    .hero p {margin: .3rem 0 0 0; opacity: .88; color:#fff;}
-    .event {padding: 1rem 1.2rem; border-left: 5px solid #ff4b4b;
-            background: rgba(255,75,75,.10); border-radius: 8px; margin: .6rem 0;}
-    .fact {padding: .7rem 1rem; border-left: 5px solid #4b8bff;
-           background: rgba(75,139,255,.10); border-radius: 8px; margin: .6rem 0;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+_rs = random.Random(11)
+_layers, _sizes = [], []
+for _tile in (260, 410, 640):
+    for _ in range(7):
+        _x, _y = _rs.randint(5, _tile - 5), _rs.randint(5, _tile - 5)
+        _px = _rs.choice([1, 1, 1.5, 2])
+        _col = _rs.choice(["#ffffff", "#cfe0ff", "#fff3d6"])
+        _layers.append(f"radial-gradient({_px}px {_px}px at {_x}px {_y}px, {_col}, transparent)")
+        _sizes.append(f"{_tile}px {_tile}px")
+_layers += [
+    "radial-gradient(ellipse 100% 26% at 50% 112%, rgba(120,190,255,.95) 0%, rgba(40,110,220,.80) 40%, rgba(10,30,90,0) 72%)",
+    "radial-gradient(ellipse at 12% 18%, rgba(120,70,210,.38), transparent 46%)",
+    "radial-gradient(ellipse at 88% 30%, rgba(30,110,230,.30), transparent 44%)",
+    "radial-gradient(ellipse at 50% 60%, rgba(10,18,60,.9), #02030a 80%)",
+]
+_sizes += ["100% 100%"] * 4
+
+_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&display=swap');
+html, body {background-color:#02030a !important; background-image: __BG__ !important;
+  background-size: __SZ__ !important; background-repeat: repeat !important; background-attachment: fixed !important;}
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stToolbar"] {background: transparent !important;}
+[data-testid="stSidebar"] > div:first-child {background: rgba(6,10,32,.84) !important; backdrop-filter: blur(6px);}
+.block-container, [data-testid="stMainBlockContainer"] {background: rgba(4,8,26,.58); border:1px solid rgba(122,162,255,.20);
+  border-radius:18px; padding: 1.4rem 2rem 3rem !important; margin-top:.8rem; backdrop-filter: blur(5px); max-width: 1250px;}
+h1, h2, h3, h4 {font-family:'Orbitron', sans-serif !important; letter-spacing:.5px;}
+[data-testid="stMetric"] {background: rgba(20,32,80,.55); border:1px solid rgba(122,162,255,.30); border-radius:12px; padding:10px 14px;}
+.stTabs [data-baseweb="tab-list"] {gap:4px; flex-wrap: wrap;}
+.stTabs [data-baseweb="tab"] {background: rgba(25,40,100,.45); border-radius:10px 10px 0 0; padding: 8px 14px;}
+.stTabs [aria-selected="true"] {background: rgba(70,110,255,.55) !important;}
+div.stButton > button {border-radius:12px; border:1px solid #7aa2ff; background: rgba(40,70,170,.45); color:#fff; transition: all .2s;}
+div.stButton > button:hover {box-shadow: 0 0 14px rgba(122,162,255,.8); border-color:#fff; color:#fff;}
+.hero {display:flex; flex-wrap:wrap; align-items:center; gap:1.2rem; padding:1.1rem 1.4rem; border-radius:16px;
+  background: linear-gradient(135deg, rgba(11,16,38,.85), rgba(27,42,107,.75) 55%, rgba(75,42,123,.75));
+  border:1px solid rgba(122,162,255,.35); box-shadow: 0 0 30px rgba(80,120,255,.25); margin-bottom:1rem;}
+.hero h1 {margin:0; font-size:1.8rem; letter-spacing:3px; color:#fff;}
+.hero p {margin:.3rem 0 .5rem 0; color:#dbe4ff; opacity:.92;}
+.pill {display:inline-block; font-size:.7rem; letter-spacing:1px; padding:3px 10px; margin:2px 6px 2px 0; border-radius:999px;
+  border:1px solid rgba(122,162,255,.5); background: rgba(20,32,80,.6); color:#cfe0ff; font-family: monospace;}
+.dot {display:inline-block; width:8px; height:8px; border-radius:50%; background:#3cff9e; margin-right:6px; animation: blink 1.4s infinite;}
+.sat {transform-box: view-box; transform-origin: 50px 50px; animation: spin 9s linear infinite;}
+@keyframes spin {to {transform: rotate(360deg);}}
+@keyframes blink {50% {opacity:.25;}}
+.event {padding: 1rem 1.2rem; border-left: 5px solid #ff4b4b; background: rgba(255,75,75,.12); border-radius: 8px; margin: .6rem 0;}
+.fact {padding: .7rem 1rem; border-left: 5px solid #4b8bff; background: rgba(75,139,255,.12); border-radius: 8px; margin: .6rem 0;}
+</style>
+"""
+st.markdown(_CSS.replace("__BG__", ", ".join(_layers)).replace("__SZ__", ", ".join(_sizes)), unsafe_allow_html=True)
 
 with st.sidebar:
     st.selectbox("🌐 Language", LK, format_func=lambda k: LANGS[k][0], key="lang")
@@ -291,7 +362,16 @@ with st.sidebar:
     st.markdown("### 🏅 " + T("Explorer badges"))
     st.progress(len(ss.done) / len(BADGES))
     st.write(" ".join(icon if key in ss.done else "🔒" for key, icon in BADGES.items()))
-    st.caption(T("Earn all 5 badges: finish the mission, build a working Moon base, find geostationary orbit, survive re-entry, land on Mars."))
+    st.caption(T("Earn all 7 badges: finish the mission, build a working Moon base, find geostationary orbit, survive re-entry, land on Mars, find a habitable planet, save Earth from an asteroid."))
+    if ss.lang != "en":
+        _all = set(ALL_TEXTS)
+        _d = _store()["d"]
+        _pct = sum(1 for _t in _all if (ss.lang, _t) in _d) / max(1, len(_all))
+        st.progress(_pct, text=f"🌐 {_pct * 100:.0f}%")
+        if _pct < 1.0 and st.button("🔁 Retry translation"):
+            _store()["blocked_until"] = 0.0
+            _store()["fails"] = 0
+            st.rerun()
     if st.button("🔄 " + C("restart")):
         for k in list(ss.keys()):
             if k not in ("lang",):
@@ -301,8 +381,12 @@ with st.sidebar:
 st.markdown(
     f"""
     <div class="hero">
-      <h1>🚀 ASTRA MISSION TRAINER</h1>
-      <p>{C('tagline')}</p>
+      <div class="patch"><svg width="92" height="92" viewBox="0 0 100 100"><defs><radialGradient id="eg" cx="40%" cy="35%"><stop offset="0" stop-color="#7fc4ff"/><stop offset="1" stop-color="#0b2a78"/></radialGradient></defs><circle cx="50" cy="50" r="47" fill="#050a22" stroke="#7aa2ff" stroke-width="3"/><circle cx="50" cy="50" r="40" fill="none" stroke="#c7d6ff" stroke-width="1" stroke-dasharray="2 4"/><circle cx="50" cy="56" r="22" fill="url(#eg)"/><ellipse cx="50" cy="50" rx="40" ry="14" fill="none" stroke="#ffd36e" stroke-width="1.6" transform="rotate(-25 50 50)"/><g class="sat"><circle cx="90" cy="50" r="3.2" fill="#ffd36e"/></g><path d="M50 10 L54 22 L50 19 L46 22 Z" fill="#fff"/></svg></div>
+      <div>
+        <h1>ASTRA MISSION TRAINER</h1>
+        <p>{C('tagline')}</p>
+        <div><span class="pill"><i class="dot"></i>SIMULATION ONLINE</span><span class="pill">11 LANGUAGES</span><span class="pill">10 LABS</span><span class="pill">NASA SPACE APPS CHALLENGE 2026</span></div>
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -314,7 +398,7 @@ if ss.lang != "en" and GoogleTranslator is None:
 tabs = st.tabs([
     "🛰️ " + C("tab_mission"), "🌙 " + C("tab_base"), "🌍 " + C("tab_orbit"),
     "🪐 " + C("tab_gravity"), "🫁 " + C("tab_life"), "🔥 " + C("tab_reentry"),
-    "🔴 " + C("tab_mars"),
+    "🔴 " + C("tab_mars"), "🔭 " + C("tab_exo"), "☄️ " + C("tab_defense"), "🌗 " + C("tab_moon"),
 ])
 
 # =============================================================================
@@ -560,6 +644,12 @@ with tabs[3]:
     df = pd.DataFrame({T("Feels like (kg on Earth)"): [mass * x / 9.80665 for x in BODIES.values()]}, index=[T(n) for n in BODIES])
     st.bar_chart(df)
 
+    st.markdown("---")
+    st.markdown("#### 🎂 " + T("Your age on other planets"))
+    age = st.slider(T("Your age (Earth years)"), 5, 100, 14)
+    adf = pd.DataFrame({T("Age (planet years)"): [round(age / y, 2) for y in YEARS.values()]}, index=[T(n) for n in YEARS])
+    st.dataframe(adf, use_container_width=True)
+
 # =============================================================================
 # 5) LIFE SUPPORT PLANNER
 # =============================================================================
@@ -672,5 +762,123 @@ with tabs[6]:
     st.line_chart(hdf)
     st.button("🔄 " + C("restart"), key="ml_restart", on_click=ml_reset)
 
+# =============================================================================
+# 8) EXOPLANET LAB
+# =============================================================================
+with tabs[7]:
+    st.subheader("🔭 " + T("Exoplanet Lab"))
+    st.write(T("Find planets where liquid water could exist. Pick a star and place your planet. The green band is the habitable zone: not too hot and not too cold. This is a simplified model."))
+    star_name = st.selectbox(T("Star type"), list(STARS), index=1, format_func=T)
+    lum = STARS[star_name]
+    ex1, ex2 = st.columns(2)
+    dist = ex1.slider(T("Planet distance from its star (AU)"), 0.05, 6.0, 1.0, 0.01)
+    albedo = ex2.slider(T("Reflectivity (albedo)"), 0.0, 0.9, 0.3, 0.05)
+    hz_in, hz_out = 0.95 * math.sqrt(lum), 1.37 * math.sqrt(lum)
+    t_eq = 278.6 * ((1 - albedo) ** 0.25) * (lum ** 0.25) / math.sqrt(dist)
+    em1, em2, em3 = st.columns(3)
+    em1.metric(T("Equilibrium temperature (C)"), f"{t_eq - 273.15:.0f}")
+    em2.metric(T("Habitable zone starts (AU)"), f"{hz_in:.2f}")
+    em3.metric(T("Habitable zone ends (AU)"), f"{hz_out:.2f}")
+    xs_ = alt.Scale(domain=[0, 6])
+    chart = alt.Chart(pd.DataFrame({"a": [hz_in], "b": [hz_out]})).mark_rect(opacity=0.25, color="green").encode(
+        x=alt.X("a:Q", scale=xs_, title="AU"), x2="b:Q")
+    chart += alt.Chart(pd.DataFrame({"x": [dist], "y": [0.0]})).mark_point(size=260, filled=True, color="#ffd36e").encode(
+        x=alt.X("x:Q", scale=xs_), y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[-1, 1])))
+    if star_name == "Sun-like star":
+        sol = pd.DataFrame({"x": [0.39, 0.72, 1.0, 1.52, 5.2], "y": [0.0] * 5,
+                            "name": [T(n) for n in ("Mercury", "Venus", "Earth", "Mars", "Jupiter")]})
+        chart += alt.Chart(sol).mark_point(size=60, color="#9bb7ff").encode(x=alt.X("x:Q", scale=xs_), y=alt.Y("y:Q", axis=None))
+        chart += alt.Chart(sol).mark_text(dy=-16, color="#ffffff").encode(x=alt.X("x:Q", scale=xs_), y=alt.Y("y:Q", axis=None), text="name:N")
+    st.altair_chart(chart.properties(height=220), use_container_width=True)
+    if hz_in <= dist <= hz_out:
+        st.success("🌱 " + T("In the habitable zone! Liquid water could exist here."))
+        mark("exo")
+    elif dist < hz_in:
+        st.error("🔥 " + T("Too hot. Water would boil away."))
+    else:
+        st.info("🧊 " + T("Too cold. Water would freeze."))
+    st.caption(T("Earth's equilibrium temperature is about -18 C. Its atmosphere warms it to about 15 C."))
+
+# =============================================================================
+# 9) PLANETARY DEFENSE
+# =============================================================================
+with tabs[8]:
+    st.subheader("☄️ " + T("Planetary Defense"))
+    st.write(T("An asteroid is heading for Earth! Hit it with kinetic impactors, like NASA's DART mission, early enough to push it off course. This is a simplified model."))
+    pd1, pd2 = st.columns(2)
+    dia = pd1.slider(T("Asteroid diameter (m)"), 50, 600, 160, 10)
+    lead = pd1.slider(T("Warning time (years)"), 0.5, 20.0, 8.0, 0.5)
+    n_imp = pd2.slider(T("Number of impactor spacecraft"), 1, 20, 4)
+    m_imp = pd2.slider(T("Spacecraft mass (kg)"), 300, 1500, 600, 50)
+    v_imp = pd2.slider(T("Impact speed (km/s)"), 4.0, 10.0, 6.0, 0.5)
+    BETA = 3.0
+    ast_mass = 2000.0 * (4.0 / 3.0) * math.pi * (dia / 2.0) ** 3
+    dv = BETA * n_imp * m_imp * v_imp * 1000.0 / ast_mass
+    YR = 3.15576e7
+    shift_km = dv * lead * YR / 1000.0
+    NEED_KM = 6371.0
+    dm1, dm2, dm3 = st.columns(3)
+    dm1.metric(T("Asteroid mass (million tonnes)"), f"{ast_mass / 1e9:.1f}")
+    dm2.metric(T("Speed change (mm/s)"), f"{dv * 1000:.2f}")
+    dm3.metric(T("Miss distance (km)"), f"{shift_km:,.0f}")
+    st.progress(min(shift_km / NEED_KM, 1.0))
+    leads = np.linspace(0.5, 20, 40)
+    ldf = pd.DataFrame({"years": leads, "km": [dv * y * YR / 1000.0 for y in leads]})
+    dchart = alt.Chart(ldf).mark_line(color="#ff9f43").encode(
+        x=alt.X("years:Q", title=T("Warning time (years)")), y=alt.Y("km:Q", title="km"))
+    dchart += alt.Chart(pd.DataFrame({"km": [NEED_KM]})).mark_rule(color="red").encode(y="km:Q")
+    st.altair_chart(dchart.properties(height=240), use_container_width=True)
+    st.caption(T("Red line: about one Earth radius (6,371 km), enough to miss Earth."))
+    if shift_km >= NEED_KM:
+        st.success("🛡️ " + T("Earth is safe! The asteroid will miss us."))
+        mark("defense")
+    else:
+        st.warning("⚠️ " + T("Not enough deflection. Add spacecraft, mass, speed or warning time."))
+    st.caption(T("In 2022 NASA's DART spacecraft hit the asteroid Dimorphos and shortened its orbit by about 32 minutes."))
+
+# =============================================================================
+# 10) MOON PHASE LAB
+# =============================================================================
+def phase_name(d):
+    for lim, nm in [(1.0, "New Moon"), (6.4, "Waxing Crescent"), (8.4, "First Quarter"), (13.4, "Waxing Gibbous"),
+                    (16.1, "Full Moon"), (21.1, "Waning Gibbous"), (23.1, "Last Quarter"), (28.5, "Waning Crescent")]:
+        if d < lim:
+            return nm
+    return "New Moon"
+
+
+def moon_svg(day):
+    th = 2 * math.pi * day / 29.53
+    if th <= math.pi:
+        sign, k = 1, math.cos(th)
+    else:
+        sign, k = -1, math.cos(2 * math.pi - th)
+    r = 80
+    pts = []
+    for i in range(61):
+        phi = math.pi * i / 60
+        pts.append((sign * r * math.sin(phi), -r * math.cos(phi)))
+    for i in range(60, -1, -1):
+        phi = math.pi * i / 60
+        pts.append((sign * k * r * math.sin(phi), -r * math.cos(phi)))
+    poly = " ".join(f"{100 + x:.1f},{100 + y:.1f}" for x, y in pts)
+    return (f'<svg width="220" height="220" viewBox="0 0 200 200"><circle cx="100" cy="100" r="80" fill="#171c3a" '
+            f'stroke="#5a6aa8" stroke-width="2"/><polygon points="{poly}" fill="#f1eedf"/></svg>')
+
+
+with tabs[9]:
+    st.subheader("🌗 " + T("Moon Phase Lab"))
+    st.write(T("Slide through one lunar month and watch the Moon change. The Moon takes about 29.5 days to go from new moon to new moon."))
+    day = st.slider(T("Days since new moon"), 0.0, 29.5, 7.4, 0.1)
+    illum = (1 - math.cos(2 * math.pi * day / 29.53)) / 2
+    mc1, mc2 = st.columns([1, 1])
+    with mc1:
+        st.markdown(f'<div style="text-align:center">{moon_svg(day)}</div>', unsafe_allow_html=True)
+    with mc2:
+        st.metric(T("Phase"), T(phase_name(day)))
+        st.metric(T("Illuminated"), f"{illum * 100:.0f}%")
+        st.metric(T("Moon age (days)"), f"{day:.1f}")
+    st.caption(T("The Moon always shows the same face to Earth because it is tidally locked."))
+
 st.divider()
-st.caption(T("Built for the NASA Space Apps Challenge. Scenarios and models are simplified and fictional, not real mission procedures."))
+st.caption(T("Independent educational project created for the NASA Space Apps Challenge. Not affiliated with or endorsed by NASA. Scenarios and models are simplified and fictional."))
